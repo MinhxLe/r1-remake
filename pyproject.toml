@@ -1,0 +1,31 @@
+[project]
+name = "r1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "attrs>=24.3.0",
+    "einops>=0.8.0",
+    "torch>=2.5.1",
+    "torchaudio>=2.5.1",
+    "torchrl>=0.6.0",
+    "torchvision>=0.20.1",
+    "tqdm>=4.67.1",
+    "wandb>=0.19.2",
+]
+[dependency-groups]
+dev = [
+    "ipdb>=0.13.13",
+    "ipython>=8.31.0",
+    "neovim>=0.3.1",
+    "pyright>=1.1.391",
+    "pytest>=8.3.4",
+    "ruff>=0.8.4",
+]
+
+[tool.uv.sources]
+mle = { workspace = true }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
