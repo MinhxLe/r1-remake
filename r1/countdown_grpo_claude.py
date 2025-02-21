@@ -9,7 +9,7 @@ from datasets import Dataset
 import numpy as np
 from tensordict import TensorDict
 from torch.nn.utils.rnn import pad_sequence
-from loguru import logger
+import logging
 import json
 from datetime import datetime
 from r1.data.countdown import get_dataset, compute_score, Task
@@ -19,7 +19,7 @@ from r1.data.core import Split, extract_task_response
 @dataclass
 class GRPOConfig:
     # Model configs
-    model_name: str = "meta-llama/Llama-3.2-3B"
+    model_name: str = "unsloth/Llama-3.2-3B-Instruct"
     max_length: int = 1000
     
     # Training configs
@@ -67,15 +67,17 @@ class CountdownGRPO:
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
             torch_dtype=torch.bfloat16,
-            device_map="auto" 
         )
+        self.model.to(self.device)
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.model_name,
             padding_side="left", 
-            trust_remote_code=True
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        
         
     def _compute_rewards(self, responses: List[str], task: Task) -> torch.Tensor:
         """Compute rewards for a group of responses"""
@@ -346,7 +348,10 @@ class CountdownGRPO:
                         self.tokenizer.save_pretrained("best_model")
 
 if __name__ == "__main__":
-    # Initialize and train
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
     config = GRPOConfig()
     trainer = CountdownGRPO(config)
     trainer.train()
