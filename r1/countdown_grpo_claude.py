@@ -1,11 +1,10 @@
 import os
 import re
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import wandb
 from dataclasses import dataclass
 from typing import Optional, List
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from unsloth import FastLanguageModel
 from datasets import Dataset
 import numpy as np
 from tensordict import TensorDict
@@ -63,15 +62,20 @@ class CountdownGRPO:
         )
             
     def _init_model(self):
-        """Initialize the model and tokenizer with unsloth optimizations"""
+        """Initialize the model and tokenizer using transformers"""
 
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=config.model_name,
-            dtype = "bfloat16",
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.config.model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto" 
         )
-        self.model = model
-        self.tokenizer = tokenizer
-        self.model = self.model.to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.config.model_name,
+            padding_side="left", 
+            trust_remote_code=True
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         
     def _compute_rewards(self, responses: List[str], task: Task) -> torch.Tensor:
         """Compute rewards for a group of responses"""
@@ -193,15 +197,15 @@ class CountdownGRPO:
             batch_old_log_probs = []
             batch_rewards = []
             batch_advantages = []
-            # first iteration holding pi_theta_old model constant
-            # potentially could relax this and leta theta_old vary with task
+            # iteration over all prompts holding pi_theta_old model constant
+            # potentially could relax this and let theta_old vary with task
             for task in training_batch:
                 responses, old_log_probs = self._generate_group_responses(
                     task["prompt"][0]["content"], 
                     self.config.group_size
                 )
 
-                sequence_mask = torch.zeros(old_log_probs.shape[0], device=self.device)
+                sequence_mask = torch.zeros(old_log_probs.shape, device=self.device)
                 for i,response in enumerate(responses):
                     sequence_mask[i, :len(response)] = 1.0
 
@@ -236,7 +240,7 @@ class CountdownGRPO:
                     )
 
                     # TODO: check if this is correct
-                    policy_objective_by_response = policy_objective_matrix.multiply(sequence_masks) / sequence_masks.sum(dim=1, keepdim=True)
+                    policy_objective_by_response = policy_objective_matrix.multiply(sequence_masks).sum(dim=1).div(sequence_masks.sum(dim=1))
                     policy_objective = policy_objective_by_response.mean()
 
                     # Compute KL penalty
