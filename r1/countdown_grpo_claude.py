@@ -24,7 +24,8 @@ class GRPOConfig:
     max_length: int = 1000
     
     # Training configs
-    batch_size: int = 4
+    batches_per_iteration: int = 10
+    train_batch_size: int = 4
     eval_batch_size: int = 8
     learning_rate: float = 1e-5
     num_epochs: int = 10
@@ -105,6 +106,35 @@ class CountdownGRPO:
         ratio = ref_probs / torch.softmax(logits, dim=-1)
         return (ratio - torch.log(ratio) - 1).mean()
 
+    def _compute_log_probs(self, responses: List[str]) -> torch.Tensor:
+        """Compute log probabilities for a list of responses using the current model.
+        
+        Args:
+            responses: List of text responses to compute log probs for
+            
+        Returns:
+            torch.Tensor: Padded tensor of log probabilities for each token in each response
+        """
+
+        input_ids = self.tokenizer(responses, return_tensors="pt", padding=True).input_ids.to(self.device)
+        outputs = self.model(input_ids, labels=input_ids)
+        scores = torch.stack(outputs.scores)  # [new_tokens, batch, vocab_size]
+        token_log_probs = torch.log_softmax(scores.squeeze(1), dim=-1)  # [new_tokens, vocab_size]
+        
+        # TODO: check all this crazy indexing
+        generated_token_ids = input_ids[:, 1:]  # Remove BOS token
+        new_log_probs = torch.gather(
+            token_log_probs,
+            dim=-1, 
+            index=generated_token_ids.T.unsqueeze(-1)
+        ).squeeze(-1)
+        
+        return pad_sequence(
+            [new_log_probs[:len(r)-1] for r in responses],
+            batch_first=True,
+            padding_value=0
+        )
+
     def _generate_group_responses(
         self, 
         prompt: str,
@@ -148,94 +178,85 @@ class CountdownGRPO:
         log_probs = pad_sequence(log_probs, batch_first=True, padding_value=0)
         return responses, log_probs
 
-# one grpo iteration
-# store pi_current as pi_ref
-# for steps 1..M
-#  sample batch of B prompts
-#  store pi_current as pi_old
-#  sample G times for each prompt using pi_old
-#  get rewards for G X B
-#  advantage is normalized within G for one question
-#  advantage is applied to all tokens within the response
-#  (where did iteration over B go...?)
-#  take mu steps:
-#    compute ratio of current/old probs
-#    compute policy loss
-#    compute kl current vs ref
-#    take a step
+    def _outer_iteration(self, optimizer: torch.optim.Optimizer) -> dict:
+        """Perform one outer iteration of GRPO"""
 
-# question: does current keep changing with each of the mu steps? i would think yes.
-# where are we iterating over B?
+        # this needs to be a deep copy
+        reference_model = self.model
 
-    def _grpo_step(
-        self,
-        prompt: str,
-        task: Task,
-        optimizer: torch.optim.Optimizer
-    ) -> dict:
-        """Perform one GRPO optimization step"""
-        # Generate group of responses from current policy
-        responses, old_log_probs = self._generate_group_responses(
-            prompt, 
-            self.config.group_size
-        )
-        
-        # Compute rewards and advantages
-        rewards = self._compute_rewards(responses, task)
-        advantages = self._normalize_advantages(rewards)
-        
-        # Store initial model state for reference
-        ref_state_dict = {
-            name: param.clone().detach()
-            for name, param in self.model.named_parameters()
-        }
-        
-        total_loss = 0
-        # Multiple optimization iterations
-        for _ in range(self.config.mu):
-            # Generate new responses with current policy
-            _, new_log_probs = self._generate_group_responses(
-                prompt,
-                self.config.group_size
-            )
+        for step in range(self.config.batches_per_iteration):
+            training_batch = self.train_dataset.select(range(self.config.train_batch_size))
+
+            # implicit iteration over elements of training_batch
+            batch_responses=[]
+            batch_sequence_masks = []
+            batch_old_log_probs = []
+            batch_rewards = []
+            batch_advantages = []
+            # first iteration holding pi_theta_old model constant
+            # potentially could relax this and leta theta_old vary with task
+            for task in training_batch:
+                responses, old_log_probs = self._generate_group_responses(
+                    task["prompt"][0]["content"], 
+                    self.config.group_size
+                )
+
+                sequence_mask = torch.zeros(old_log_probs.shape[0], device=self.device)
+                for i,response in enumerate(responses):
+                    sequence_mask[i, :len(response)] = 1.0
+
+                batch_responses.append(responses)
+                batch_sequence_masks.append(sequence_mask)
+                batch_old_log_probs.append(old_log_probs)
+                rewards = self._compute_rewards(responses, task)
+                batch_rewards.append(rewards)
+                batch_advantages.append(self._normalize_advantages(rewards))
             
-            # Compute probability ratios
-            ratio = torch.exp(new_log_probs - old_log_probs)
-            
-            # Compute clipped objective
-            clipped_ratio = torch.clamp(
-                ratio,
-                1 - self.config.epsilon,
-                1 + self.config.epsilon
-            )
-            
-            # Compute losses
-            policy_loss = -torch.min(
-                ratio * advantages.unsqueeze(-1),
-                clipped_ratio * advantages.unsqueeze(-1)
-            ).mean()
-            
-            # Compute KL penalty
-            kl_div = self._compute_kl_div(old_log_probs, new_log_probs)
-            
-            # Total loss
-            loss = policy_loss + self.config.beta * kl_div
-            
-            # Optimization step
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-        
+            for responses, sequence_masks,old_log_probs, rewards, advantages in zip(batch_responses, batch_sequence_masks,batch_old_log_probs, batch_rewards, batch_advantages):
+                for gradient_step in range(self.config.mu):
+                    # Get log probs from current model for the same responses
+                    # TODO: check if shape matches old_log_probs
+                    new_log_probs = self._compute_log_probs(responses)
+                    
+                    # Compute probability ratios
+                    ratio = torch.exp(new_log_probs - old_log_probs)
+                    
+                    # Compute clipped objective
+                    clipped_ratio = torch.clamp(
+                        ratio,
+                        1 - self.config.epsilon,
+                        1 + self.config.epsilon
+                    )
+                    
+                    expanded_advantages = advantages.unsqueeze(-1).expand_as(ratio)
+ 
+                    policy_objective_matrix = torch.min(
+                        ratio * expanded_advantages,
+                        clipped_ratio * expanded_advantages
+                    )
+
+                    # TODO: check if this is correct
+                    policy_objective_by_response = policy_objective_matrix.multiply(sequence_masks) / sequence_masks.sum(dim=1, keepdim=True)
+                    policy_objective = policy_objective_by_response.mean()
+
+                    # Compute KL penalty
+                    # This is supposed to be an average over responses and tokens, check if it's working
+                    kl_div = self._compute_kl_div(old_log_probs, new_log_probs)
+                    
+                    # Total objective
+                    objective = policy_objective - self.config.beta * kl_div
+                    loss = -objective
+                    
+                    # Optimization step
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+
         return {
-            "loss": total_loss / self.config.mu,
-            "rewards": rewards.mean().item(),
-            "max_reward": rewards.max().item(),
-            "response_lengths": [len(r) for r in responses],
-            "sample_response": responses[0]
+            # tbd stuff for logging? is this the right interval?
         }
-
+            
     @torch.no_grad()
     def evaluate(self, dataset: Dataset, num_examples: int = 100) -> dict:
         """Evaluate the model on a dataset"""
