@@ -15,16 +15,28 @@ from datetime import datetime
 from r1.data.countdown import get_dataset, compute_score, Task
 from r1.data.core import Split, extract_task_response
 
+@dataclass
+class ResponseGroup:
+    responses: List[str]
+    response_token_ids: List[torch.Tensor]
+    log_probs: torch.Tensor
+    sequence_mask: torch.Tensor
+
+    def __init__(self, responses: List[str], response_token_ids: List[torch.Tensor], log_probs: List[torch.Tensor], device: torch.device):
+        self.sequence_mask = pad_sequence([torch.ones_like(log_prob, device=device) for log_prob in log_probs], batch_first=True, padding_value=0).detach()
+        self.responses = responses
+        self.response_token_ids = response_token_ids
+        self.log_probs = pad_sequence(log_probs, batch_first=True, padding_value=0).detach()
 
 @dataclass
 class GRPOConfig:
     # Model configs
-    model_name: str = "unsloth/Llama-3.2-3B-Instruct"
-    max_length: int = 1000
+    model_name: str = "unsloth/Llama-3.2-1B-Instruct"
+    max_length: int = 500
     
     # Training configs
     batches_per_iteration: int = 10
-    train_batch_size: int = 4
+    train_batch_size: int = 2
     eval_batch_size: int = 8
     learning_rate: float = 1e-5
     num_epochs: int = 10
@@ -119,36 +131,36 @@ class CountdownGRPO:
         # Need to iterate here!
         input_ids = self.tokenizer(responses, return_tensors="pt", padding=True).input_ids.to(self.device)
         outputs = self.model(input_ids, labels=input_ids)
-        scores = torch.stack(outputs.scores)  # [new_tokens, batch, vocab_size]
-        token_log_probs = torch.log_softmax(scores.squeeze(1), dim=-1)  # [new_tokens, vocab_size]
+
+        logits = outputs.logits[:, :-1, :]  # [batch, seq_len-1, vocab_size]
+        token_log_probs = torch.log_softmax(logits, dim=-1)  # [batch, seq_len-1, vocab_size]
         
-        # TODO: check all this crazy indexing
-        generated_token_ids = input_ids[:, 1:]  # Remove BOS token
+        # Get the actual token ids (excluding the last position used for labels)
+        generated_token_ids = input_ids[:, 1:]  # Remove first token
+        
+        # Gather the log probs for the actual tokens
         new_log_probs = torch.gather(
             token_log_probs,
             dim=-1, 
-            index=generated_token_ids.T.unsqueeze(-1)
-        ).squeeze(-1)
+            index=generated_token_ids.unsqueeze(-1)
+        ).squeeze(-1)  # [batch, seq_len-1]
         
-        return pad_sequence(
-            [new_log_probs[:len(r)-1] for r in responses],
-            batch_first=True,
-            padding_value=0
-        )
+        return new_log_probs
 
-    def _generate_group_responses(
+    def _generate_response_group(
         self, 
         prompt: str,
         num_samples: int,
         max_new_tokens: int = 1000
-    ) -> tuple[List[str], torch.Tensor, torch.Tensor]:
+    ) -> ResponseGroup:
         """Generate multiple responses and their log probs for a single prompt"""
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
         
         responses = []
+        response_token_ids = []
         log_probs = []
         
-        #TODO: change to batch eval but watch padding
+        #TODO: change to batch eval but watch padding and indexing
         for _ in range(num_samples):
             with torch.no_grad():
                 outputs = self.model.generate(
@@ -173,9 +185,11 @@ class CountdownGRPO:
                     index=response_ids[input_ids.shape[1]:].unsqueeze(-1)
                 ).squeeze(-1)
                 log_probs.append(step_log_probs)
-                
-        sequence_mask = pad_sequence([torch.ones_like(log_prob, device=self.device) for log_prob in log_probs], batch_first=True, padding_value=0)
-        return responses, pad_sequence(log_probs, batch_first=True, padding_value=0), sequence_mask
+                response_token_ids.append(response_ids)
+
+        return ResponseGroup(responses,response_token_ids,log_probs,self.device)
+
+
 
     def _outer_iteration(self, optimizer: torch.optim.Optimizer) -> dict:
         """Perform one outer iteration of GRPO"""
@@ -189,36 +203,31 @@ class CountdownGRPO:
             training_batch = self.train_dataset.select(range(self.config.train_batch_size))
 
             # implicit iteration over elements of training_batch
-            batch_responses=[]
-            batch_sequence_masks = []
-            batch_old_log_probs = []
+            batch_response_groups = []
             batch_rewards = []
             batch_advantages = []
             # iteration over all prompts holding pi_theta_old model constant
             # potentially could relax this and let theta_old vary with task
             for task in training_batch:
-                responses, old_log_probs, sequence_mask = self._generate_group_responses(
+                response_group = self._generate_response_group(
                     task["prompt"][0]["content"], 
                     self.config.group_size
                 )
-                old_log_probs = old_log_probs.detach()
 
-                batch_responses.append(responses)
-                batch_sequence_masks.append(sequence_mask)
-                batch_old_log_probs.append(old_log_probs)
-                rewards = self._compute_rewards(responses, task)
+                batch_response_groups.append(response_group)
+                rewards = self._compute_rewards(response_group.responses, task)
                 batch_rewards.append(rewards)
                 batch_advantages.append(self._normalize_advantages(rewards))
             
-            for responses, sequence_masks,old_log_probs, rewards, advantages in zip(batch_responses, batch_sequence_masks,batch_old_log_probs, batch_rewards, batch_advantages):
+            for response_group, rewards, advantages in zip(batch_response_groups, batch_rewards, batch_advantages):
                 for gradient_step in range(self.config.mu):
                     # Get log probs from current model for the same responses
                     # TODO: check if shape matches old_log_probs
                     # TODO: how to deal with fact that we're now sending full sequence? ask cursor
-                    new_log_probs = self._compute_log_probs(responses)
+                    new_log_probs = self._compute_log_probs(response_group.responses)
                     
                     # Compute probability ratios
-                    ratio = torch.exp(new_log_probs - old_log_probs)
+                    ratio = torch.exp(new_log_probs - response_group.log_probs)
                     
                     # Compute clipped objective
                     clipped_ratio = torch.clamp(
@@ -235,12 +244,12 @@ class CountdownGRPO:
                     )
 
                     # TODO: check if this is correct
-                    policy_objective_by_response = policy_objective_matrix.multiply(sequence_masks).sum(dim=1).div(sequence_masks.sum(dim=1))
+                    policy_objective_by_response = policy_objective_matrix.multiply(response_group.sequence_mask).sum(dim=1).div(response_group.sequence_mask.sum(dim=1))
                     policy_objective = policy_objective_by_response.mean()
 
                     # Compute KL penalty
                     # This is supposed to be an average over responses and tokens, check if it's working
-                    kl_div = self._compute_kl_div(old_log_probs, new_log_probs)
+                    kl_div = self._compute_kl_div(response_group.log_probs, new_log_probs)
                     
                     # Total objective
                     objective = policy_objective - self.config.beta * kl_div
