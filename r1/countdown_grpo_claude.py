@@ -140,14 +140,14 @@ class CountdownGRPO:
         prompt: str,
         num_samples: int,
         max_new_tokens: int = 1000
-    ) -> tuple[List[str], torch.Tensor]:
+    ) -> tuple[List[str], torch.Tensor, torch.Tensor]:
         """Generate multiple responses and their log probs for a single prompt"""
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
         
         responses = []
         log_probs = []
         
-        #TODO: change to batch eval
+        #TODO: change to batch eval but watch padding
         for _ in range(num_samples):
             with torch.no_grad():
                 outputs = self.model.generate(
@@ -160,13 +160,12 @@ class CountdownGRPO:
                     output_scores=True
                 )
 
-                response_ids = outputs.sequences[0]
-                responses.append(self.tokenizer.decode(response_ids[input_ids.shape[1]:], skip_special_tokens=True))
+                generated_token_ids = outputs.sequences[0][input_ids.shape[1]:]
+                responses.append(self.tokenizer.decode(generated_token_ids, skip_special_tokens=True))
                 
                 # TODO: Check the indexing here, are we getting the right prob?
                 scores = torch.stack(outputs.scores)  # [new_tokens, 1, vocab_size]
                 token_log_probs = torch.log_softmax(scores.squeeze(1), dim=-1)  # [new_tokens, vocab_size]
-                generated_token_ids = response_ids[input_ids.shape[1]:]
                 step_log_probs = torch.gather(
                     token_log_probs,
                     dim=-1,
@@ -174,9 +173,8 @@ class CountdownGRPO:
                 ).squeeze(-1)
                 log_probs.append(step_log_probs)
                 
-        # Pad log probs to same length
-        log_probs = pad_sequence(log_probs, batch_first=True, padding_value=0)
-        return responses, log_probs
+        sequence_mask = pad_sequence([torch.ones_like(log_prob, device=self.device) for log_prob in log_probs], batch_first=True, padding_value=0)
+        return responses, pad_sequence(log_probs, batch_first=True, padding_value=0), sequence_mask
 
     def _outer_iteration(self, optimizer: torch.optim.Optimizer) -> dict:
         """Perform one outer iteration of GRPO"""
@@ -196,14 +194,11 @@ class CountdownGRPO:
             # iteration over all prompts holding pi_theta_old model constant
             # potentially could relax this and let theta_old vary with task
             for task in training_batch:
-                responses, old_log_probs = self._generate_group_responses(
+                responses, old_log_probs, sequence_mask = self._generate_group_responses(
                     task["prompt"][0]["content"], 
                     self.config.group_size
                 )
-
-                sequence_mask = torch.zeros(old_log_probs.shape, device=self.device)
-                for i,response in enumerate(responses):
-                    sequence_mask[i, :len(response)] = 1.0
+                old_log_probs = old_log_probs.detach()
 
                 batch_responses.append(responses)
                 batch_sequence_masks.append(sequence_mask)
