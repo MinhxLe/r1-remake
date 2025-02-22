@@ -33,7 +33,7 @@ Assistant: Let me solve this step by step.
 
 def get_dataset(split: Split):
     # [TODO] add split implementation
-    raw_dataset = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split=split)
+    raw_dataset = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split="train")
 
     def process_fn(task: Task, idx: int) -> DatasetRow:
         return {
