@@ -116,6 +116,7 @@ class CountdownGRPO:
             torch.Tensor: Padded tensor of log probabilities for each token in each response
         """
 
+        # Need to iterate here!
         input_ids = self.tokenizer(responses, return_tensors="pt", padding=True).input_ids.to(self.device)
         outputs = self.model(input_ids, labels=input_ids)
         scores = torch.stack(outputs.scores)  # [new_tokens, batch, vocab_size]
@@ -180,6 +181,8 @@ class CountdownGRPO:
         """Perform one outer iteration of GRPO"""
 
         # this needs to be a deep copy
+        # wait, no - if we get all training batches upfront, we can compute
+        # ref probs for all of them! easy.
         reference_model = self.model
 
         for step in range(self.config.batches_per_iteration):
@@ -211,6 +214,7 @@ class CountdownGRPO:
                 for gradient_step in range(self.config.mu):
                     # Get log probs from current model for the same responses
                     # TODO: check if shape matches old_log_probs
+                    # TODO: how to deal with fact that we're now sending full sequence? ask cursor
                     new_log_probs = self._compute_log_probs(responses)
                     
                     # Compute probability ratios
