@@ -160,8 +160,8 @@ class CountdownGRPO:
                     output_scores=True
                 )
 
-                generated_token_ids = outputs.sequences[0][input_ids.shape[1]:]
-                responses.append(self.tokenizer.decode(generated_token_ids, skip_special_tokens=True))
+                response_ids = outputs.sequences[0]
+                responses.append(self.tokenizer.decode(response_ids, skip_special_tokens=True))
                 
                 # TODO: Check the indexing here, are we getting the right prob?
                 scores = torch.stack(outputs.scores)  # [new_tokens, 1, vocab_size]
@@ -169,7 +169,7 @@ class CountdownGRPO:
                 step_log_probs = torch.gather(
                     token_log_probs,
                     dim=-1,
-                    index=generated_token_ids.unsqueeze(-1)
+                    index=response_ids[input_ids.shape[1]:].unsqueeze(-1)
                 ).squeeze(-1)
                 log_probs.append(step_log_probs)
                 
