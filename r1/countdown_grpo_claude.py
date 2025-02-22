@@ -81,19 +81,13 @@ class CountdownGRPO:
         
     def _compute_rewards(self, responses: List[str], task: Task) -> torch.Tensor:
         """Compute rewards for a group of responses"""
-        rewards = []
-        # TODO: revise this: the compute_score already checks for rationale, so maybe
-        # just adjust rationale scoring within the compute_score function
-        # instead of this mess
-        for response in responses:
-            format_score = self.config.format_score if bool(re.search(r"<think>.*</think>", response)) else 0.0
-            rewards.append(compute_score(
+
+        return torch.tensor([compute_score(
                 response,
                 task,
-                format_score,
+                self.config.format_score,
                 self.config.solve_score
-            ))
-        return torch.tensor(rewards, device=self.device)
+            ) for response in responses], device=self.device)
 
     def _normalize_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
         """Normalize rewards within a group to get advantages"""

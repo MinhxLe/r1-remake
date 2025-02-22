@@ -80,20 +80,25 @@ def compute_score(
     response_str: str, task: Task, fmt_score: float, score: float
 ) -> float:
     response = extract_task_response(response_str)
-    if response is not None:
-        equation_str = response.answer
-        if equation_str is not None and _validate_equation(equation_str, task["nums"]):
-            answer = _evaluate_equation(equation_str)
-            if answer is not None:
-                if math.isclose(answer, task["target"]):
-                    computed_score = score
-                else:
-                    computed_score = fmt_score
-            else:
-                computed_score = fmt_score
-        else:
-            computed_score = fmt_score
-    else:
-        computed_score = 0
-
-    return computed_score
+    if response is None:
+        return 0
+    
+    equation_str = response.answer
+    if equation_str is None:
+        return 0
+    
+    earned_fmt_score = fmt_score*(response.rationale is not None)
+    
+    if not _validate_equation(equation_str, task["nums"]):
+        return earned_fmt_score
+    
+    answer = _evaluate_equation(equation_str)
+    if answer is None:
+        # seems a little weird to give formatting score
+        # when equation doesn't parse. maybe this should be 0?
+        return earned_fmt_score
+    
+    if math.isclose(answer, task["target"]):
+        return score
+    
+    return earned_fmt_score
