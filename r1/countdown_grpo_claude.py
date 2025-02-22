@@ -32,7 +32,9 @@ class ResponseGroup:
 class GRPOConfig:
     # Model configs
     model_name: str = "unsloth/Llama-3.2-1B-Instruct"
-    max_length: int = 500
+
+    # Generation configs
+    max_new_tokens: int = 500
     
     # Training configs
     batches_per_iteration: int = 10
@@ -211,7 +213,8 @@ class CountdownGRPO:
             for task in training_batch:
                 response_group = self._generate_response_group(
                     task["prompt"][0]["content"], 
-                    self.config.group_size
+                    self.config.group_size,
+                    self.config.max_new_tokens,
                 )
 
                 batch_response_groups.append(response_group)
