@@ -171,15 +171,15 @@ class CountdownGRPO:
                     temperature=0.7,
                     pad_token_id=self.tokenizer.pad_token_id,
                     return_dict_in_generate=True,
-                    output_scores=True
+                    output_logits=True
                 )
 
                 response_ids = outputs.sequences[0]
                 responses.append(self.tokenizer.decode(response_ids, skip_special_tokens=True))
                 
                 # TODO: Check the indexing here, are we getting the right prob?
-                scores = torch.stack(outputs.scores)  # [new_tokens, 1, vocab_size]
-                token_log_probs = torch.log_softmax(scores.squeeze(1), dim=-1)  # [new_tokens, vocab_size]
+                logits = torch.stack(outputs.logits)  # [new_tokens, 1, vocab_size]
+                token_log_probs = torch.log_softmax(logits.squeeze(1), dim=-1)  # [new_tokens, vocab_size]
                 step_log_probs = torch.gather(
                     token_log_probs,
                     dim=-1,
