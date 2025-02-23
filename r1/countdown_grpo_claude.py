@@ -1,5 +1,4 @@
 import os
-import re
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import wandb
@@ -7,12 +6,12 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 from datasets import Dataset
 import numpy as np
-from tensordict import TensorDict
 from torch.nn.utils.rnn import pad_sequence
 import logging
 import json
 from datetime import datetime
 from r1.data.countdown import get_dataset, compute_score, Task
+import copy
 
 @dataclass
 class ResponseGroup:
@@ -43,6 +42,7 @@ class ResponseGroup:
 class GRPOConfig:
     # Model configs
     model_name: str = "unsloth/Llama-3.2-1B-Instruct"
+    model_temperature: float = 0.7
 
     # Generation configs
     max_new_tokens: int = 500
@@ -122,23 +122,24 @@ class CountdownGRPO:
             return torch.zeros_like(rewards)
         return (rewards - mean) / std
 
-    def _compute_kl_div(self, ref_logits: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+    def _compute_kl_div_for_group(self, ref_log_probs: torch.Tensor, log_probs: torch.Tensor, sequence_mask: torch.Tensor) -> torch.Tensor:
         """Compute KL divergence using the unbiased estimator from the paper"""
 
-        # TODO: This might be incorrect, not clear what it's vectorized over
-        # Also, maybe this should be probs and not logits?
-        ref_probs = torch.softmax(ref_logits, dim=-1)
-        ratio = ref_probs / torch.softmax(logits, dim=-1)
-        return (ratio - torch.log(ratio) - 1).mean()
+        ratio = ref_log_probs / log_probs
+        unmasked_expression = ratio - torch.log(ratio) - 1
+        masked_expression = unmasked_expression.multiply(sequence_mask).sum(dim=1).div(sequence_mask.sum(dim=1))
+        return masked_expression.mean()
 
-    def _compute_log_probs(self, response_group: ResponseGroup) -> torch.Tensor:
+    @torch.no_grad()
+    def _compute_log_probs(self, model: AutoModelForCausalLM, response_group: ResponseGroup) -> torch.Tensor:
         """Compute log probabilities for a list of responses using the current model."""
 
+        model.eval()
         # Need to iterate here for OOM safety
         log_probs_list = []
         for response_ids in response_group.response_token_ids:
             input_ids = response_ids.unsqueeze(0)
-            outputs = self.model(input_ids, labels=input_ids)
+            outputs = model(input_ids, labels=input_ids)
             token_log_probs = torch.log_softmax(outputs.logits[:, :-1, :], dim=-1)
             log_probs_list.append(torch.gather(
                 token_log_probs,
@@ -148,6 +149,7 @@ class CountdownGRPO:
 
         return pad_sequence(log_probs_list, batch_first=True, padding_value=0)
 
+    @torch.no_grad()
     def _generate_response_group(
         self, 
         prompt: str,
@@ -155,6 +157,9 @@ class CountdownGRPO:
         max_new_tokens: int = 1000
     ) -> ResponseGroup:
         """Generate multiple responses and their log probs for a single prompt"""
+
+        self.model.eval()
+
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
         
         responses = []
@@ -163,40 +168,36 @@ class CountdownGRPO:
         
         #TODO: change to batch eval but watch padding and indexing
         for _ in range(num_samples):
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    input_ids,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=True,
-                    temperature=0.7,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    return_dict_in_generate=True,
-                    output_logits=True
-                )
+            outputs = self.model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=self.config.model_temperature,
+                pad_token_id=self.tokenizer.pad_token_id,
+                return_dict_in_generate=True,
+                output_logits=True
+            )
 
-                response_ids = outputs.sequences[0]
-                responses.append(self.tokenizer.decode(response_ids, skip_special_tokens=True))
-                
-                # TODO: Check the indexing here, are we getting the right prob?
-                logits = torch.stack(outputs.logits)  # [new_tokens, 1, vocab_size]
-                token_log_probs = torch.log_softmax(logits.squeeze(1), dim=-1)  # [new_tokens, vocab_size]
-                step_log_probs = torch.gather(
-                    token_log_probs,
-                    dim=-1,
-                    index=response_ids[input_ids.shape[1]:].unsqueeze(-1)
-                ).squeeze(-1)
-                log_probs.append(step_log_probs)
-                response_token_ids.append(response_ids)
+            response_ids = outputs.sequences[0]
+            responses.append(self.tokenizer.decode(response_ids, skip_special_tokens=True))
+            
+            # TODO: Check the indexing here, are we getting the right prob?
+            logits = torch.stack(outputs.logits)  # [new_tokens, 1, vocab_size]
+            token_log_probs = torch.log_softmax(logits.squeeze(1), dim=-1)  # [new_tokens, vocab_size]
+            step_log_probs = torch.gather(
+                token_log_probs,
+                dim=-1,
+                index=response_ids[input_ids.shape[1]:].unsqueeze(-1)
+            ).squeeze(-1)
+            log_probs.append(step_log_probs)
+            response_token_ids.append(response_ids)
 
         return ResponseGroup(responses=responses, response_token_ids=response_token_ids, log_probs_list=log_probs, generated_token_id_start=input_ids.shape[1], device=self.device)
 
     def _outer_iteration(self, optimizer: torch.optim.Optimizer) -> dict:
         """Perform one outer iteration of GRPO"""
 
-        # this needs to be a deep copy
-        # wait, no - if we get all training batches upfront, we can compute
-        # ref probs for all of them! easy.
-        reference_model = self.model
+        reference_model = copy.deepcopy(self.model)
 
         for step in range(self.config.batches_per_iteration):
             training_batch = self.train_dataset.select(range(self.config.train_batch_size))
@@ -205,6 +206,7 @@ class CountdownGRPO:
             batch_response_groups = []
             batch_rewards = []
             batch_advantages = []
+            batch_ref_log_probs = []
             # iteration over all prompts holding pi_theta_old model constant
             # potentially could relax this and let theta_old vary with task
             for task in training_batch:
@@ -218,17 +220,13 @@ class CountdownGRPO:
                 rewards = self._compute_rewards(response_group.responses, task)
                 batch_rewards.append(rewards)
                 batch_advantages.append(self._normalize_advantages(rewards))
-            
-            for response_group, rewards, advantages in zip(batch_response_groups, batch_rewards, batch_advantages):
-                for gradient_step in range(self.config.mu):
-                    # Get log probs from current model for the same responses
+                batch_ref_log_probs.append(self._compute_log_probs(reference_model, response_group).detach())
 
-                    new_log_probs = self._compute_log_probs(response_group)
-                    
-                    # Compute probability ratios
+            for response_group, rewards, advantages, ref_log_probs in zip(batch_response_groups, batch_rewards, batch_advantages, batch_ref_log_probs):
+                for _ in range(self.config.mu):
+   
+                    new_log_probs = self._compute_log_probs(self.model, response_group)
                     ratio = torch.exp(new_log_probs - response_group.log_probs_tensor)
-                    
-                    # Compute clipped objective
                     clipped_ratio = torch.clamp(
                         ratio,
                         1 - self.config.epsilon,
@@ -242,18 +240,15 @@ class CountdownGRPO:
                         clipped_ratio * expanded_advantages
                     )
 
-                    # TODO: check if this is correct
                     policy_objective_by_response = policy_objective_matrix.multiply(response_group.sequence_mask).sum(dim=1).div(response_group.sequence_mask.sum(dim=1))
                     policy_objective = policy_objective_by_response.mean()
 
-                    # Compute KL penalty
-                    # This is supposed to be an average over responses and tokens, check if it's working
-                    kl_div = self._compute_kl_div(response_group.log_probs_tensor, new_log_probs)
+                    kl_div = self._compute_kl_div_for_group(ref_log_probs = ref_log_probs, log_probs = new_log_probs, sequence_mask = response_group.sequence_mask)
                     
-                    # Total objective
                     objective = policy_objective - self.config.beta * kl_div
                     loss = -objective
                     
+                    self.model.train()
                     # Optimization step
                     optimizer.zero_grad()
                     loss.backward()
