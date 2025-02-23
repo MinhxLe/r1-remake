@@ -3,7 +3,7 @@ import re
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import wandb
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List
 from datasets import Dataset
 import numpy as np
@@ -13,20 +13,31 @@ import logging
 import json
 from datetime import datetime
 from r1.data.countdown import get_dataset, compute_score, Task
-from r1.data.core import Split, extract_task_response
 
 @dataclass
 class ResponseGroup:
     responses: List[str]
     response_token_ids: List[torch.Tensor]
-    log_probs: torch.Tensor
-    sequence_mask: torch.Tensor
+    log_probs_list: List[torch.Tensor]
+    generated_token_id_start: int
+    device: torch.device
+    
+    sequence_mask: torch.Tensor = field(init=False)
+    log_probs_tensor: torch.Tensor = field(init=False)
 
-    def __init__(self, responses: List[str], response_token_ids: List[torch.Tensor], log_probs: List[torch.Tensor], device: torch.device):
-        self.sequence_mask = pad_sequence([torch.ones_like(log_prob, device=device) for log_prob in log_probs], batch_first=True, padding_value=0).detach()
-        self.responses = responses
-        self.response_token_ids = response_token_ids
-        self.log_probs = pad_sequence(log_probs, batch_first=True, padding_value=0).detach()
+    def __post_init__(self):
+        # Process the sequence mask and log probs after initialization
+        self.sequence_mask = pad_sequence(
+            [torch.ones_like(lp, device=self.device) for lp in self.log_probs_list],
+            batch_first=True,
+            padding_value=0
+        ).detach()
+        
+        self.log_probs_tensor = pad_sequence(
+            self.log_probs_list,
+            batch_first=True,
+            padding_value=0
+        ).detach()
 
 @dataclass
 class GRPOConfig:
@@ -120,34 +131,22 @@ class CountdownGRPO:
         ratio = ref_probs / torch.softmax(logits, dim=-1)
         return (ratio - torch.log(ratio) - 1).mean()
 
-    def _compute_log_probs(self, responses: List[str]) -> torch.Tensor:
-        """Compute log probabilities for a list of responses using the current model.
-        
-        Args:
-            responses: List of text responses to compute log probs for
-            
-        Returns:
-            torch.Tensor: Padded tensor of log probabilities for each token in each response
-        """
+    def _compute_log_probs(self, response_group: ResponseGroup) -> torch.Tensor:
+        """Compute log probabilities for a list of responses using the current model."""
 
-        # Need to iterate here!
-        input_ids = self.tokenizer(responses, return_tensors="pt", padding=True).input_ids.to(self.device)
-        outputs = self.model(input_ids, labels=input_ids)
+        # Need to iterate here for OOM safety
+        log_probs_list = []
+        for response_ids in response_group.response_token_ids:
+            input_ids = response_ids.unsqueeze(0)
+            outputs = self.model(input_ids, labels=input_ids)
+            token_log_probs = torch.log_softmax(outputs.logits[:, :-1, :], dim=-1)
+            log_probs_list.append(torch.gather(
+                token_log_probs,
+                dim=-1, 
+                index=input_ids[:, 1:].unsqueeze(-1)
+            ).squeeze(-1).squeeze(0)[(response_group.generated_token_id_start-1):])
 
-        logits = outputs.logits[:, :-1, :]  # [batch, seq_len-1, vocab_size]
-        token_log_probs = torch.log_softmax(logits, dim=-1)  # [batch, seq_len-1, vocab_size]
-        
-        # Get the actual token ids (excluding the last position used for labels)
-        generated_token_ids = input_ids[:, 1:]  # Remove first token
-        
-        # Gather the log probs for the actual tokens
-        new_log_probs = torch.gather(
-            token_log_probs,
-            dim=-1, 
-            index=generated_token_ids.unsqueeze(-1)
-        ).squeeze(-1)  # [batch, seq_len-1]
-        
-        return new_log_probs
+        return pad_sequence(log_probs_list, batch_first=True, padding_value=0)
 
     def _generate_response_group(
         self, 
@@ -189,9 +188,7 @@ class CountdownGRPO:
                 log_probs.append(step_log_probs)
                 response_token_ids.append(response_ids)
 
-        return ResponseGroup(responses,response_token_ids,log_probs,self.device)
-
-
+        return ResponseGroup(responses=responses, response_token_ids=response_token_ids, log_probs_list=log_probs, generated_token_id_start=input_ids.shape[1], device=self.device)
 
     def _outer_iteration(self, optimizer: torch.optim.Optimizer) -> dict:
         """Perform one outer iteration of GRPO"""
@@ -227,10 +224,11 @@ class CountdownGRPO:
                     # Get log probs from current model for the same responses
                     # TODO: check if shape matches old_log_probs
                     # TODO: how to deal with fact that we're now sending full sequence? ask cursor
-                    new_log_probs = self._compute_log_probs(response_group.responses)
+
+                    new_log_probs = self._compute_log_probs(response_group)
                     
                     # Compute probability ratios
-                    ratio = torch.exp(new_log_probs - response_group.log_probs)
+                    ratio = torch.exp(new_log_probs - response_group.log_probs_tensor)
                     
                     # Compute clipped objective
                     clipped_ratio = torch.clamp(
@@ -252,7 +250,7 @@ class CountdownGRPO:
 
                     # Compute KL penalty
                     # This is supposed to be an average over responses and tokens, check if it's working
-                    kl_div = self._compute_kl_div(response_group.log_probs, new_log_probs)
+                    kl_div = self._compute_kl_div(response_group.log_probs_tensor, new_log_probs)
                     
                     # Total objective
                     objective = policy_objective - self.config.beta * kl_div
