@@ -222,8 +222,6 @@ class CountdownGRPO:
             for response_group, rewards, advantages in zip(batch_response_groups, batch_rewards, batch_advantages):
                 for gradient_step in range(self.config.mu):
                     # Get log probs from current model for the same responses
-                    # TODO: check if shape matches old_log_probs
-                    # TODO: how to deal with fact that we're now sending full sequence? ask cursor
 
                     new_log_probs = self._compute_log_probs(response_group)
                     
