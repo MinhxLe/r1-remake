@@ -165,7 +165,9 @@ class CountdownGRPO:
 
                 #TODO: Evaluate on held out sample
                 #and save model if it's good!
-
+                
+        if self.wandb:
+            wandb.finish()
 
 
     def _outer_iteration(self, batched_training_indices: Iterable[Iterable[int]], optimizer: torch.optim.Optimizer) -> GRPOIterationMetrics:
