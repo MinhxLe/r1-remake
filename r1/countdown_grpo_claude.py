@@ -196,6 +196,10 @@ class CountdownGRPO:
                 batch_advantages.append(self._normalize_advantages(rewards))
                 batch_ref_log_probs.append(self._compute_log_probs(reference_model, response_group, no_grad = True).detach())
 
+            torch.cuda.empty_cache()
+            self.model.train()
+            self.model.gradient_checkpointing_enable()
+
             for response_group, rewards, advantages, ref_log_probs in zip(batch_response_groups, batch_rewards, batch_advantages, batch_ref_log_probs):
                 for _ in range(self.config.mu):
 
@@ -222,11 +226,12 @@ class CountdownGRPO:
                     objective = policy_objective - self.config.beta * kl_div
                     loss = -objective
 
-                    self.model.train()
                     # Optimization step
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
+
+            self.model.gradient_checkpointing_disable()
 
         flattened_rewards = [reward for rewards in batch_rewards for reward in rewards]
         flattened_reply_lengths = [reply_length for response_group in batch_response_groups for reply_length in response_group.sequence_mask.sum(dim=1).tolist()]
@@ -304,7 +309,7 @@ class CountdownGRPO:
     def _compute_kl_div_for_group(self, ref_log_probs: torch.Tensor, log_probs: torch.Tensor, sequence_mask: torch.Tensor) -> torch.Tensor:
         """Compute KL divergence using the unbiased estimator from the paper"""
 
-        ratio = ref_log_probs / log_probs
+        ratio = torch.exp(ref_log_probs - log_probs)
         unmasked_expression = ratio - torch.log(ratio) - 1
         masked_expression = unmasked_expression.multiply(sequence_mask).sum(dim=1).div(sequence_mask.sum(dim=1))
         return masked_expression.mean()
@@ -312,24 +317,26 @@ class CountdownGRPO:
     def _compute_log_probs(self, model: AutoModelForCausalLM, response_group: ResponseGroup, no_grad: bool = False) -> torch.Tensor:
         """Compute log probabilities for a list of responses using the current model."""
 
-        model.eval()
-        context = torch.no_grad() if no_grad else nullcontext()
+        if no_grad:
+            model.eval()
+            context = torch.no_grad()
+        else:
+            context = nullcontext()
 
         with context:
-          # Need to iterate here for OOM safety
-          log_probs_list = []
-          for response_ids in response_group.response_token_ids:
-              input_ids = response_ids.unsqueeze(0)
-              outputs = model(input_ids, labels=input_ids)
-              token_log_probs = torch.log_softmax(outputs.logits[:, :-1, :], dim=-1)
-              log_probs_list.append(torch.gather(
-                  token_log_probs,
-                  dim=-1,
-                  index=input_ids[:, 1:].unsqueeze(-1)
-              ).squeeze(-1).squeeze(0)[(response_group.generated_token_id_start-1):])
+            # Need to iterate here for OOM safety
+            log_probs_list = []
+            for response_ids in response_group.response_token_ids:
+                input_ids = response_ids.unsqueeze(0)
+                outputs = model(input_ids, labels=input_ids)
+                token_log_probs = torch.log_softmax(outputs.logits[:, :-1, :], dim=-1)
+                log_probs_list.append(torch.gather(
+                    token_log_probs,
+                    dim=-1,
+                    index=input_ids[:, 1:].unsqueeze(-1)
+                ).squeeze(-1).squeeze(0)[(response_group.generated_token_id_start-1):])
 
-          return pad_sequence(log_probs_list, batch_first=True, padding_value=0)
-
+        return pad_sequence(log_probs_list, batch_first=True, padding_value=0)
 
     def _create_batched_training_index_list(self, seed: int) -> List[List[int]]:
         """
