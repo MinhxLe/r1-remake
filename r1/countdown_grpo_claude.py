@@ -3,15 +3,15 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import wandb
 from dataclasses import dataclass, field
-from typing import Optional, List
-from datasets import Dataset
-import numpy as np
+from typing import List, Iterable
 from torch.nn.utils.rnn import pad_sequence
 import logging
 import json
 from datetime import datetime
 from r1.data.countdown import get_dataset, compute_score, Task
 import copy
+import random
+from contextlib import nullcontext
 
 @dataclass
 class ResponseGroup:
@@ -20,7 +20,7 @@ class ResponseGroup:
     log_probs_list: List[torch.Tensor]
     generated_token_id_start: int
     device: torch.device
-    
+
     sequence_mask: torch.Tensor = field(init=False)
     log_probs_tensor: torch.Tensor = field(init=False)
 
@@ -31,61 +31,73 @@ class ResponseGroup:
             batch_first=True,
             padding_value=0
         ).detach()
-        
+
         self.log_probs_tensor = pad_sequence(
             self.log_probs_list,
             batch_first=True,
             padding_value=0
         ).detach()
 
+
+@dataclass
+class GRPOIterationMetrics:
+    objective: float
+    policy_objective: float
+    kl_div: float
+    mean_reward: float
+    fraction_correct: float
+    mean_reply_length: float
+    sample_response: str
+
+
 @dataclass
 class GRPOConfig:
+
+    seed: int = 42
+
     # Model configs
     model_name: str = "unsloth/Llama-3.2-1B-Instruct"
     model_temperature: float = 0.7
 
     # Generation configs
     max_new_tokens: int = 500
-    
+
     # Training configs
-    batches_per_iteration: int = 10
+    batches_per_iteration: int = 2
     train_batch_size: int = 2
     eval_batch_size: int = 8
     learning_rate: float = 1e-5
-    num_epochs: int = 10
-    
+    num_epochs: int = 1
+
     # GRPO specific configs
-    group_size: int = 8  # G in the paper
+    response_group_size: int = 8  # G in the paper
     epsilon: float = 0.2  # ε for clipping
-    beta: float = 0.01   # KL penalty coefficient
-    mu: int = 5         # Number of GRPO iterations per batch
-    
+    beta: float = 0.01   # KL divergence penalty coefficient
+    mu: int = 5         # Number of optimization steps per prompt
+
     # Reward configs
     format_score: float = 0.1
     solve_score: float = 1.0
-    
+
     # Logging configs
-    log_every_n_steps: int = 100
-    eval_every_n_steps: int = 500
-    save_generations_every_n_steps: int = 1000
+    log_every_n_steps: int = 1
+    eval_every_n_steps: int = 50
+    save_model_every_n_steps: int = 50
+    save_generations_every_n_steps: int = 1
     generation_log_file: str = "generations.jsonl"
 
 class CountdownGRPO:
     def __init__(self, config: GRPOConfig):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+
         self._init_model()
-        
+
         self.train_dataset = get_dataset("train")
         self.test_dataset = get_dataset("test")
-        
-        wandb.init(
-            project="countdown-grpo",
-            config=vars(config),
-            name=f"grpo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
-            
+
+        self.wandb = os.getenv("WANDB_API_KEY")
+
     def _init_model(self):
         """Initialize the model and tokenizer using transformers"""
 
@@ -97,13 +109,180 @@ class CountdownGRPO:
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.model_name,
-            padding_side="left", 
+            padding_side="left",
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        
-        
+    def train(self):
+
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate)
+        outer_iteration_count = 0
+        best_eval_reward = 0
+        random.seed(self.config.seed)
+
+        if self.wandb:
+            wandb.init(
+                project="countdown-grpo",
+                config=vars(config),
+                name=f"grpo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+
+        for _ in range(self.config.num_epochs):
+            batched_training_index_list = self._create_batched_training_index_list(seed=random.randint(0, 1e6))
+
+            for batched_training_indices in batched_training_index_list:
+
+                # Perform GRPO update
+                metrics = self._outer_iteration(batched_training_indices, optimizer)
+                outer_iteration_count += 1
+
+                if outer_iteration_count % self.config.log_every_n_steps == 0:
+                    logger.info(f"Iteration {outer_iteration_count} metrics: {metrics}")
+                    if self.wandb:
+                        wandb.log({
+                            "objective": metrics.objective,
+                            "policy_objective": metrics.policy_objective,
+                            "kl_div": metrics.kl_div,
+                            "mean_reward": metrics.mean_reward,
+                            "fraction_correct": metrics.fraction_correct,
+                            "mean_reply_length": metrics.mean_reply_length,
+                            "iteration": outer_iteration_count
+                        })
+
+                if outer_iteration_count % self.config.save_generations_every_n_steps == 0:
+                    logger.info(f"Iteration {outer_iteration_count} response: {metrics.sample_response}")
+                    with open(self.config.generation_log_file, "a") as f:
+                        json.dump({
+                            "iteration": outer_iteration_count,
+                            "response": metrics.sample_response
+                        }, f)
+                        f.write("\n")
+
+                if outer_iteration_count % self.save_model_every_n_steps == 0:
+                    self.model.save_pretrained(f"model_{outer_iteration_count}")
+                    self.tokenizer.save_pretrained(f"model_{outer_iteration_count}")
+
+                #TODO: Evaluate on held out sample
+                #and save model if it's good!
+
+
+
+    def _outer_iteration(self, batched_training_indices: Iterable[Iterable[int]], optimizer: torch.optim.Optimizer) -> GRPOIterationMetrics:
+        """Perform one outer iteration of GRPO"""
+
+        reference_model = copy.deepcopy(self.model)
+
+        for training_indices in batched_training_indices:
+            training_batch = self.train_dataset.select(training_indices)
+
+            # implicit iteration over elements of training_batch
+            batch_response_groups = []
+            batch_rewards = []
+            batch_advantages = []
+            batch_ref_log_probs = []
+            # iteration over all prompts holding pi_theta_old model constant
+            # potentially could relax this and let theta_old vary with task
+            for task in training_batch:
+                response_group = self._generate_response_group(
+                    task["prompt"][0]["content"],
+                    self.config.response_group_size,
+                    self.config.max_new_tokens,
+                )
+
+                batch_response_groups.append(response_group)
+                rewards = self._compute_rewards(response_group.responses, task)
+                batch_rewards.append(rewards)
+                batch_advantages.append(self._normalize_advantages(rewards))
+                batch_ref_log_probs.append(self._compute_log_probs(reference_model, response_group, no_grad = True).detach())
+
+            for response_group, rewards, advantages, ref_log_probs in zip(batch_response_groups, batch_rewards, batch_advantages, batch_ref_log_probs):
+                for _ in range(self.config.mu):
+
+                    new_log_probs = self._compute_log_probs(self.model, response_group)
+                    ratio = torch.exp(new_log_probs - response_group.log_probs_tensor)
+                    clipped_ratio = torch.clamp(
+                        ratio,
+                        1 - self.config.epsilon,
+                        1 + self.config.epsilon
+                    )
+
+                    expanded_advantages = advantages.unsqueeze(-1).expand_as(ratio)
+
+                    policy_objective_matrix = torch.min(
+                        ratio * expanded_advantages,
+                        clipped_ratio * expanded_advantages
+                    )
+
+                    policy_objective_by_response = policy_objective_matrix.multiply(response_group.sequence_mask).sum(dim=1).div(response_group.sequence_mask.sum(dim=1))
+                    policy_objective = policy_objective_by_response.mean()
+
+                    kl_div = self._compute_kl_div_for_group(ref_log_probs = ref_log_probs, log_probs = new_log_probs, sequence_mask = response_group.sequence_mask)
+
+                    objective = policy_objective - self.config.beta * kl_div
+                    loss = -objective
+
+                    self.model.train()
+                    # Optimization step
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+        flattened_rewards = [reward for rewards in batch_rewards for reward in rewards]
+        flattened_reply_lengths = [reply_length for response_group in batch_response_groups for reply_length in response_group.sequence_mask.sum(dim=1).tolist()]
+
+        return GRPOIterationMetrics(objective= objective.item(),
+            policy_objective = policy_objective.item(),
+            kl_div = kl_div.item(),
+            mean_reward = sum(flattened_rewards)/len(flattened_rewards),
+            fraction_correct = sum([1 for reward in flattened_rewards if reward == self.config.solve_score]) / len(flattened_rewards),
+            mean_reply_length = sum(flattened_reply_lengths) / len(flattened_reply_lengths),
+            sample_response = random.choice([response for response_group in batch_response_groups for response in response_group.responses]))
+
+    @torch.no_grad()
+    def _generate_response_group(
+        self,
+        prompt: str,
+        num_samples: int,
+        max_new_tokens: int = 1000
+    ) -> ResponseGroup:
+        """Generate multiple responses and their log probs for a single prompt"""
+
+        self.model.eval()
+
+        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+
+        responses = []
+        response_token_ids = []
+        log_probs = []
+
+        #TODO: change to batch eval but watch padding and indexing
+        for _ in range(num_samples):
+            outputs = self.model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=self.config.model_temperature,
+                pad_token_id=self.tokenizer.pad_token_id,
+                return_dict_in_generate=True,
+                output_logits=True
+            )
+
+            response_ids = outputs.sequences[0]
+            responses.append(self.tokenizer.decode(response_ids, skip_special_tokens=True))
+            logits = torch.stack(outputs.logits)  # [new_tokens, 1, vocab_size]
+            token_log_probs = torch.log_softmax(logits.squeeze(1), dim=-1)  # [new_tokens, vocab_size]
+            step_log_probs = torch.gather(
+                token_log_probs,
+                dim=-1,
+                index=response_ids[input_ids.shape[1]:].unsqueeze(-1)
+            ).squeeze(-1)
+            log_probs.append(step_log_probs)
+            response_token_ids.append(response_ids)
+
+        return ResponseGroup(responses=responses, response_token_ids=response_token_ids, log_probs_list=log_probs, generated_token_id_start=input_ids.shape[1], device=self.device)
+
+
     def _compute_rewards(self, responses: List[str], task: Task) -> torch.Tensor:
         """Compute rewards for a group of responses"""
 
@@ -130,218 +309,52 @@ class CountdownGRPO:
         masked_expression = unmasked_expression.multiply(sequence_mask).sum(dim=1).div(sequence_mask.sum(dim=1))
         return masked_expression.mean()
 
-    @torch.no_grad()
-    def _compute_log_probs(self, model: AutoModelForCausalLM, response_group: ResponseGroup) -> torch.Tensor:
+    def _compute_log_probs(self, model: AutoModelForCausalLM, response_group: ResponseGroup, no_grad: bool = False) -> torch.Tensor:
         """Compute log probabilities for a list of responses using the current model."""
 
         model.eval()
-        # Need to iterate here for OOM safety
-        log_probs_list = []
-        for response_ids in response_group.response_token_ids:
-            input_ids = response_ids.unsqueeze(0)
-            outputs = model(input_ids, labels=input_ids)
-            token_log_probs = torch.log_softmax(outputs.logits[:, :-1, :], dim=-1)
-            log_probs_list.append(torch.gather(
-                token_log_probs,
-                dim=-1, 
-                index=input_ids[:, 1:].unsqueeze(-1)
-            ).squeeze(-1).squeeze(0)[(response_group.generated_token_id_start-1):])
+        context = torch.no_grad() if no_grad else nullcontext()
 
-        return pad_sequence(log_probs_list, batch_first=True, padding_value=0)
+        with context:
+          # Need to iterate here for OOM safety
+          log_probs_list = []
+          for response_ids in response_group.response_token_ids:
+              input_ids = response_ids.unsqueeze(0)
+              outputs = model(input_ids, labels=input_ids)
+              token_log_probs = torch.log_softmax(outputs.logits[:, :-1, :], dim=-1)
+              log_probs_list.append(torch.gather(
+                  token_log_probs,
+                  dim=-1,
+                  index=input_ids[:, 1:].unsqueeze(-1)
+              ).squeeze(-1).squeeze(0)[(response_group.generated_token_id_start-1):])
 
-    @torch.no_grad()
-    def _generate_response_group(
-        self, 
-        prompt: str,
-        num_samples: int,
-        max_new_tokens: int = 1000
-    ) -> ResponseGroup:
-        """Generate multiple responses and their log probs for a single prompt"""
-
-        self.model.eval()
-
-        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
-        
-        responses = []
-        response_token_ids = []
-        log_probs = []
-        
-        #TODO: change to batch eval but watch padding and indexing
-        for _ in range(num_samples):
-            outputs = self.model.generate(
-                input_ids,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=self.config.model_temperature,
-                pad_token_id=self.tokenizer.pad_token_id,
-                return_dict_in_generate=True,
-                output_logits=True
-            )
-
-            response_ids = outputs.sequences[0]
-            responses.append(self.tokenizer.decode(response_ids, skip_special_tokens=True))
-            
-            # TODO: Check the indexing here, are we getting the right prob?
-            logits = torch.stack(outputs.logits)  # [new_tokens, 1, vocab_size]
-            token_log_probs = torch.log_softmax(logits.squeeze(1), dim=-1)  # [new_tokens, vocab_size]
-            step_log_probs = torch.gather(
-                token_log_probs,
-                dim=-1,
-                index=response_ids[input_ids.shape[1]:].unsqueeze(-1)
-            ).squeeze(-1)
-            log_probs.append(step_log_probs)
-            response_token_ids.append(response_ids)
-
-        return ResponseGroup(responses=responses, response_token_ids=response_token_ids, log_probs_list=log_probs, generated_token_id_start=input_ids.shape[1], device=self.device)
-
-    def _outer_iteration(self, optimizer: torch.optim.Optimizer) -> dict:
-        """Perform one outer iteration of GRPO"""
-
-        reference_model = copy.deepcopy(self.model)
-
-        for step in range(self.config.batches_per_iteration):
-            training_batch = self.train_dataset.select(range(self.config.train_batch_size))
-
-            # implicit iteration over elements of training_batch
-            batch_response_groups = []
-            batch_rewards = []
-            batch_advantages = []
-            batch_ref_log_probs = []
-            # iteration over all prompts holding pi_theta_old model constant
-            # potentially could relax this and let theta_old vary with task
-            for task in training_batch:
-                response_group = self._generate_response_group(
-                    task["prompt"][0]["content"], 
-                    self.config.group_size,
-                    self.config.max_new_tokens,
-                )
-
-                batch_response_groups.append(response_group)
-                rewards = self._compute_rewards(response_group.responses, task)
-                batch_rewards.append(rewards)
-                batch_advantages.append(self._normalize_advantages(rewards))
-                batch_ref_log_probs.append(self._compute_log_probs(reference_model, response_group).detach())
-
-            for response_group, rewards, advantages, ref_log_probs in zip(batch_response_groups, batch_rewards, batch_advantages, batch_ref_log_probs):
-                for _ in range(self.config.mu):
-   
-                    new_log_probs = self._compute_log_probs(self.model, response_group)
-                    ratio = torch.exp(new_log_probs - response_group.log_probs_tensor)
-                    clipped_ratio = torch.clamp(
-                        ratio,
-                        1 - self.config.epsilon,
-                        1 + self.config.epsilon
-                    )
-                    
-                    expanded_advantages = advantages.unsqueeze(-1).expand_as(ratio)
- 
-                    policy_objective_matrix = torch.min(
-                        ratio * expanded_advantages,
-                        clipped_ratio * expanded_advantages
-                    )
-
-                    policy_objective_by_response = policy_objective_matrix.multiply(response_group.sequence_mask).sum(dim=1).div(response_group.sequence_mask.sum(dim=1))
-                    policy_objective = policy_objective_by_response.mean()
-
-                    kl_div = self._compute_kl_div_for_group(ref_log_probs = ref_log_probs, log_probs = new_log_probs, sequence_mask = response_group.sequence_mask)
-                    
-                    objective = policy_objective - self.config.beta * kl_div
-                    loss = -objective
-                    
-                    self.model.train()
-                    # Optimization step
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+          return pad_sequence(log_probs_list, batch_first=True, padding_value=0)
 
 
-        return {
-            # tbd stuff for logging? is this the right interval?
-        }
-            
-    @torch.no_grad()
-    def evaluate(self, dataset: Dataset, num_examples: int = 100) -> dict:
-        """Evaluate the model on a dataset"""
-        total_rewards = []
-        response_lengths = []
-        
-        for i, example in enumerate(dataset):
-            if i >= num_examples:
-                break
-                
-            prompt = example["prompt"][0]["content"]
-            task = example["task"]
-            
-            # Generate single response for evaluation
-            responses, _ = self._generate_group_responses(prompt, num_samples=1)
-            response = responses[0]
-            
-            # Compute reward
-            reward = self._compute_rewards([response], task)[0]
-            
-            total_rewards.append(reward.item())
-            response_lengths.append(len(response))
-            
-        return {
-            "mean_reward": np.mean(total_rewards),
-            "mean_response_length": np.mean(response_lengths)
-        }
+    def _create_batched_training_index_list(self, seed: int) -> List[List[int]]:
+        """
+        Training method that creates batches of indices from the training dataset.
+        The method creates batches of size self.config.train_batch_size
+        and groups them into iterations of size self.config.batches_per_iteration.
+        """
 
-    def train(self):
-        """Main training loop"""
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate)
-        
-        global_step = 0
-        best_eval_reward = 0
-        
-        for epoch in range(self.config.num_epochs):
-            for batch_idx, example in enumerate(self.train_dataset):
-                prompt = example["prompt"][0]["content"]
-                task = example["task"]
-                
-                # Perform GRPO update
-                metrics = self._grpo_step(prompt, task, optimizer)
-                global_step += 1
-                
-                # Log metrics
-                if global_step % self.config.log_every_n_steps == 0:
-                    logger.info(f"Step {global_step}: {metrics}")
-                    if os.getenv("WANDB_API_KEY"):
-                        wandb.log({
-                            "train/loss": metrics["loss"],
-                            "train/reward": metrics["rewards"],
-                            "train/max_reward": metrics["max_reward"],
-                            "train/mean_response_length": np.mean(metrics["response_lengths"]),
-                            "global_step": global_step
-                        })
-                
-                # Save sample generations
-                if global_step % self.config.save_generations_every_n_steps == 0:
-                    with open(self.config.generation_log_file, "a") as f:
-                        json.dump({
-                            "step": global_step,
-                            "prompt": prompt,
-                            "response": metrics["sample_response"]
-                        }, f)
-                        f.write("\n")
-                
-                # Evaluate
-                if global_step % self.config.eval_every_n_steps == 0:
-                    eval_metrics = self.evaluate(self.test_dataset)
-                    logger.info(f"Evaluation: {eval_metrics}")
-                    
-                    if os.getenv("WANDB_API_KEY"):
-                        wandb.log({
-                            "eval/mean_reward": eval_metrics["mean_reward"],
-                            "eval/mean_response_length": eval_metrics["mean_response_length"],
-                            "global_step": global_step
-                        })
-                    
-                    # Save best model
-                    if eval_metrics["mean_reward"] > best_eval_reward:
-                        best_eval_reward = eval_metrics["mean_reward"]
-                        self.model.save_pretrained("best_model")
-                        self.tokenizer.save_pretrained("best_model")
+        all_indices = list(range(len(self.train_dataset)))
+
+        # Shuffle indices to randomize training
+        random.seed(seed)
+        random.shuffle(all_indices)
+
+        # Create batches of size train_batch_size
+        batches = []
+        for i in range(0,len(self.train_dataset),self.config.train_batch_size):
+            batches.append(all_indices[i:i + self.config.train_batch_size])
+
+        batched_training_index_list = []
+        # Group batches into iterations of size batches_per_iteration
+        for i in range(0, len(batches), self.config.batches_per_iteration):
+            batched_training_index_list.append(batches[i:i + self.config.batches_per_iteration])
+
+        return batched_training_index_list
 
 if __name__ == "__main__":
 
