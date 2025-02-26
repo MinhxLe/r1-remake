@@ -312,9 +312,9 @@ class CountdownGRPO:
 
         self.model.eval()
 
-        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(
-            self.device
-        )
+        tokenizer_output = self.tokenizer(prompt, return_tensors="pt")
+        input_ids = tokenizer_output.input_ids.to(self.device)
+        attention_mask = tokenizer_output.attention_mask.to(self.device)
 
         responses = []
         response_token_ids = []
@@ -323,7 +323,8 @@ class CountdownGRPO:
         # TODO: change to batch eval but watch padding and indexing
         for _ in range(num_samples):
             outputs = self.model.generate(
-                input_ids,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=self.config.model_temperature,
@@ -363,8 +364,13 @@ class CountdownGRPO:
 
         return torch.tensor(
             [
-                compute_score(
-                    response, task, self.config.format_score, self.config.solve_score
+                float(
+                    compute_score(
+                        response,
+                        task,
+                        self.config.format_score,
+                        self.config.solve_score,
+                    )
                 )
                 for response in responses
             ],
