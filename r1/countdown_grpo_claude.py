@@ -80,10 +80,10 @@ class GRPOConfig:
     solve_score: float = 1.0
 
     # Logging configs
-    log_every_n_steps: int = 1
-    eval_every_n_steps: int = 50
-    save_model_every_n_steps: int = 50
-    save_generations_every_n_steps: int = 1
+    log_every_n_steps: int = 5
+    eval_every_n_steps: int = 100
+    save_model_every_n_steps: int = 100
+    save_generations_every_n_steps: int = 10
     generation_log_file: str = "generations.jsonl"
 
 class CountdownGRPO:
@@ -159,7 +159,7 @@ class CountdownGRPO:
                         }, f)
                         f.write("\n")
 
-                if outer_iteration_count % self.save_model_every_n_steps == 0:
+                if outer_iteration_count % self.config.save_model_every_n_steps == 0:
                     self.model.save_pretrained(f"model_{outer_iteration_count}")
                     self.tokenizer.save_pretrained(f"model_{outer_iteration_count}")
 
