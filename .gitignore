@@ -6,6 +6,9 @@ dist/
 wheels/
 *.egg-info
 
+# secrets
+.env
+
 # Virtual environments
 .venv
 
@@ -13,3 +16,4 @@ tmp/
 
 wandb/
 
+.env
