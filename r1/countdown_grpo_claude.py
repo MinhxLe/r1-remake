@@ -14,6 +14,15 @@ import random
 from contextlib import nullcontext
 
 
+def _compute_grad_norm(model: torch.nn.Module) -> float:
+    total_norm = 0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.detach().data.norm(2)
+            total_norm += param_norm.item() ** 2
+    return total_norm**0.5
+
+
 @dataclass
 class ResponseGroup:
     responses: List[str]
@@ -43,6 +52,7 @@ class GRPOIterationMetrics:
     objective: float
     policy_objective: float
     kl_div: float
+    gradient_norm: float
     mean_reward: float
     fraction_correct: float
     mean_reply_length: float
@@ -145,12 +155,13 @@ class CountdownGRPO:
                     if self.wandb:
                         wandb.log(
                             {
+                                "fraction_correct": metrics.fraction_correct,
+                                "mean_reward": metrics.mean_reward,
+                                "mean_reply_length": metrics.mean_reply_length,
+                                "gradient_norm": metrics.gradient_norm,
                                 "objective": metrics.objective,
                                 "policy_objective": metrics.policy_objective,
                                 "kl_div": metrics.kl_div,
-                                "mean_reward": metrics.mean_reward,
-                                "fraction_correct": metrics.fraction_correct,
-                                "mean_reply_length": metrics.mean_reply_length,
                                 "iteration": outer_iteration_count,
                             }
                         )
@@ -260,6 +271,7 @@ class CountdownGRPO:
                     # Optimization step
                     optimizer.zero_grad()
                     loss.backward()
+                    gradient_norm = _compute_grad_norm(self.model)
                     optimizer.step()
 
             self.model.gradient_checkpointing_disable()
@@ -275,6 +287,7 @@ class CountdownGRPO:
             objective=objective.item(),
             policy_objective=policy_objective.item(),
             kl_div=kl_div.item(),
+            gradient_norm=gradient_norm,
             mean_reward=sum(flattened_rewards) / len(flattened_rewards),
             fraction_correct=sum(
                 [1 for reward in flattened_rewards if reward == self.config.solve_score]
