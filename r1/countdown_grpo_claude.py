@@ -54,8 +54,10 @@ class GRPOConfig:
     seed: int = 42
 
     # Model configs
-    model_name: str = "unsloth/Llama-3.2-1B-Instruct"
-    model_temperature: float = 0.7
+    model_name: str = "Qwen/Qwen2.5-Math-1.5B-Instruct"
+    model_temperature: float = 1.0
+    model_top_p: float = 0.95
+    model_top_k: int = 50
 
     # Generation configs
     max_new_tokens: int = 500
@@ -312,6 +314,8 @@ class CountdownGRPO:
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=self.config.model_temperature,
+                top_k=self.config.model_top_k,
+                top_p=self.config.model_top_p,
                 pad_token_id=self.tokenizer.pad_token_id,
                 return_dict_in_generate=True,
                 output_logits=True,
