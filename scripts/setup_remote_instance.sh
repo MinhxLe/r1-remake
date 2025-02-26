@@ -6,4 +6,4 @@ just sync
 
 ssh -p $REMOTE_PORT $REMOTE_USER@$REMOTE_IP 'curl -LsSf https://astral.sh/uv/install.sh | sh'
 
-ssh -p $REMOTE_PORT $REMOTE_USER@$REMOTE_IP 'uv sync'
+ssh -p $REMOTE_PORT $REMOTE_USER@$REMOTE_IP 'cd ~/$REMOTE_PROJECT_DIR && uv sync'
