@@ -1,9 +1,25 @@
 #!/bin/bash
-ssh -p $REMOTE_PORT $REMOTE_USER@$REMOTE_IP  'mkdir ~/$REMOTE_PROJECT_DIR'
 
-just sync_env
-just sync
+# start instance if not started
+INSTANCE_ID="$(vastai show instances --raw | jq '.[0].id')"
+echo "starting instance $INSTANCE_ID"
+INSTANCE_STATUS="$(vastai show instance $INSTANCE_ID --raw | jq '.actual_status')"
 
-ssh -p $REMOTE_PORT $REMOTE_USER@$REMOTE_IP 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+while [[ "$(vastai show instance $INSTANCE_ID --raw | jq -r '.actual_status')" != "running" ]]; do
+    echo "Waiting for instance to be running..."
+    sleep 10  # Wait for 10 seconds before checking again
+done
+echo "Instance is now running"
 
-ssh -p $REMOTE_PORT $REMOTE_USER@$REMOTE_IP 'cd ~/$REMOTE_PROJECT_DIR && uv sync'
+# id for minh ssh
+vastai attach ssh $INSTANCE_ID "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGNUr5z1YufAaVBGoqemW5gEDsP9/FwXkHXio5DeUCps minh.d.le27@gmail.com"
+
+INSTANCE_IP=$(vastai show instance $INSTANCE_ID --raw | jq -r '.public_ipaddr')
+INSTANCE_PORT=$(vastai show instance $INSTANCE_ID --raw | jq -r '.direct_port_start')
+
+# set up uv
+ssh -p $INSTANCE_PORT root@$INSTANCE_IP "curl -LsSf https://astral.sh/uv/install.sh | sh"
+ssh -p $INSTANCE_PORT root@$INSTANCE_IP "touch ~/.no_auto_tmux"
+
+
+# add ssh keys
