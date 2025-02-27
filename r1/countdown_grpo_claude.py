@@ -115,6 +115,7 @@ class CountdownGRPO:
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
             torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
         )
         self.model.to(self.device)
 
