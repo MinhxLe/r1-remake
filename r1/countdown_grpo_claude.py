@@ -14,6 +14,15 @@ import random
 from contextlib import nullcontext
 
 
+def _compute_grad_norm(model: torch.nn.Module) -> float:
+    total_norm = 0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.detach().data.norm(2)
+            total_norm += param_norm.item() ** 2
+    return total_norm**0.5
+
+
 @dataclass
 class ResponseGroup:
     responses: List[str]
@@ -43,6 +52,7 @@ class GRPOIterationMetrics:
     objective: float
     policy_objective: float
     kl_div: float
+    gradient_norm: float
     mean_reward: float
     fraction_correct: float
     mean_reply_length: float
@@ -54,8 +64,10 @@ class GRPOConfig:
     seed: int = 42
 
     # Model configs
-    model_name: str = "unsloth/Llama-3.2-1B-Instruct"
-    model_temperature: float = 0.7
+    model_name: str = "Qwen/Qwen2.5-Math-1.5B-Instruct"
+    model_temperature: float = 1.0
+    model_top_p: float = 0.95
+    model_top_k: int = 50
 
     # Generation configs
     max_new_tokens: int = 500
@@ -103,6 +115,7 @@ class CountdownGRPO:
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
             torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
         )
         self.model.to(self.device)
 
@@ -143,12 +156,13 @@ class CountdownGRPO:
                     if self.wandb:
                         wandb.log(
                             {
+                                "fraction_correct": metrics.fraction_correct,
+                                "mean_reward": metrics.mean_reward,
+                                "mean_reply_length": metrics.mean_reply_length,
+                                "gradient_norm": metrics.gradient_norm,
                                 "objective": metrics.objective,
                                 "policy_objective": metrics.policy_objective,
                                 "kl_div": metrics.kl_div,
-                                "mean_reward": metrics.mean_reward,
-                                "fraction_correct": metrics.fraction_correct,
-                                "mean_reply_length": metrics.mean_reply_length,
                                 "iteration": outer_iteration_count,
                             }
                         )
@@ -258,6 +272,7 @@ class CountdownGRPO:
                     # Optimization step
                     optimizer.zero_grad()
                     loss.backward()
+                    gradient_norm = _compute_grad_norm(self.model)
                     optimizer.step()
 
             self.model.gradient_checkpointing_disable()
@@ -273,6 +288,7 @@ class CountdownGRPO:
             objective=objective.item(),
             policy_objective=policy_objective.item(),
             kl_div=kl_div.item(),
+            gradient_norm=gradient_norm,
             mean_reward=sum(flattened_rewards) / len(flattened_rewards),
             fraction_correct=sum(
                 [1 for reward in flattened_rewards if reward == self.config.solve_score]
@@ -297,9 +313,9 @@ class CountdownGRPO:
 
         self.model.eval()
 
-        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(
-            self.device
-        )
+        tokenizer_output = self.tokenizer(prompt, return_tensors="pt")
+        input_ids = tokenizer_output.input_ids.to(self.device)
+        attention_mask = tokenizer_output.attention_mask.to(self.device)
 
         responses = []
         response_token_ids = []
@@ -308,10 +324,13 @@ class CountdownGRPO:
         # TODO: change to batch eval but watch padding and indexing
         for _ in range(num_samples):
             outputs = self.model.generate(
-                input_ids,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=self.config.model_temperature,
+                top_k=self.config.model_top_k,
+                top_p=self.config.model_top_p,
                 pad_token_id=self.tokenizer.pad_token_id,
                 return_dict_in_generate=True,
                 output_logits=True,
@@ -346,8 +365,13 @@ class CountdownGRPO:
 
         return torch.tensor(
             [
-                compute_score(
-                    response, task, self.config.format_score, self.config.solve_score
+                float(
+                    compute_score(
+                        response,
+                        task,
+                        self.config.format_score,
+                        self.config.solve_score,
+                    )
                 )
                 for response in responses
             ],
