@@ -12,9 +12,10 @@ echo "Instance is now running"
 
 # id for minh ssh
 vastai attach ssh $INSTANCE_ID "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGNUr5z1YufAaVBGoqemW5gEDsP9/FwXkHXio5DeUCps minh.d.le27@gmail.com"
+vastai attach ssh $INSTANCE_ID "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJOXK95nR8tL3iJlyzR5yVmln1s31VZz/5z00rNIqmQ5 minh.d.le27@gmail.com"
 
 INSTANCE_IP=$(vastai show instance $INSTANCE_ID --raw | jq -r '.public_ipaddr')
-INSTANCE_PORT=$(vastai show instance $INSTANCE_ID --raw | jq -r '.direct_port_end')
+INSTANCE_PORT=$(vastai show instance $INSTANCE_ID --raw | jq -r '.direct_port_start')
 
 # set up uv
 ssh -p $INSTANCE_PORT root@$INSTANCE_IP "curl -LsSf https://astral.sh/uv/install.sh | sh"

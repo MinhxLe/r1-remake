@@ -7,7 +7,7 @@ TASK: Task = {"nums": [1, 2], "target": 3}
 
 class TestComputeScore:
     def _fmt_response(self, equation_str: str):
-        return f"Assistant: <answer>{equation_str}</answer>"
+        return f"<answer>{equation_str}</answer>"
 
     def compute_score(self, response_str, task={"nums": [1, 2], "target": 3}):
         return compute_score(response_str, task, FMT_SCORE, SCORE)
