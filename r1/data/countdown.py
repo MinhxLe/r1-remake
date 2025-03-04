@@ -18,8 +18,7 @@ class ExtraInfo(TypedDict):
 
 
 class DatasetRow(TypedDict):
-    # prompt: list[Chat]
-    prompt: str
+    prompt: str | list[Chat]
     task: Task
     extra_info: ExtraInfo
 
@@ -35,10 +34,18 @@ def _create_prompt(task: Task) -> str:
     return f"""You area a helpful assistant. You will think about the reasoning process for the problem and then provides the user with the answer.Using the numbers {nums}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags and return the final answer in <answer> </answer> tags - for example <answer> (1 + 2) / 3 </answer>."""
 
 
-# TODO instead of manually using thes token, probably should pass in tokenizer
-def _create_qwen_instruct_prompt(task: Task) -> str:
+def _create_instruct_prompt(task: Task) -> list[Chat]:
     nums, target = task["nums"], task["target"]
-    return f"<|im_start|>system\nYou are a helpful assistant. You first thinks about the reasoning process in the mind and then provides the user with the answer.<|im_end|>\n<|im_start|>user\n Using the numbers {nums}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>.<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think>"
+    return [
+        dict(
+            role="system",
+            content="You are a helpful assistant. You first think about the reasoning process and then provide the user with the final answer.",
+        ),
+        dict(
+            role="user",
+            content=f"Using the numbers {nums}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>.",
+        ),
+    ]
 
 
 def extract_response(response_str) -> Response | None:
@@ -63,13 +70,17 @@ def extract_response(response_str) -> Response | None:
         return None
 
 
-def get_dataset(split: Split):
+def get_dataset(split: Split, use_instruct_prompt: bool):
     # [TODO] add split implementation
     raw_dataset = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split="train")
 
     def process_fn(task: Task, idx: int) -> DatasetRow:
+        if use_instruct_prompt:
+            prompt = _create_instruct_prompt(task)
+        else:
+            raise NotImplementedError
         return {
-            "prompt": _create_qwen_instruct_prompt(task),
+            "prompt": prompt,
             "task": task,
             "extra_info": {"idx": idx},
         }
@@ -119,18 +130,16 @@ def compute_score(
     if equation_str is None:
         return 0
 
-    earned_fmt_score = fmt_score * (response.rationale is not None)
-
     if not _validate_equation(equation_str, task["nums"]):
-        return earned_fmt_score
+        return fmt_score
 
     answer = _evaluate_equation(equation_str)
     if answer is None:
         # seems a little weird to give formatting score
         # when equation doesn't parse. maybe this should be 0?
-        return earned_fmt_score
+        return fmt_score
 
     if math.isclose(answer, task["target"]):
         return score
 
-    return earned_fmt_score
+    return fmt_score
