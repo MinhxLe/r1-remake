@@ -133,11 +133,13 @@ def compute_score(
     if not _validate_equation(equation_str, task["nums"]):
         return fmt_score
 
+
     answer = _evaluate_equation(equation_str)
     if answer is None:
         # seems a little weird to give formatting score
         # when equation doesn't parse. maybe this should be 0?
         return fmt_score
+
 
     if math.isclose(answer, task["target"]):
         return score
