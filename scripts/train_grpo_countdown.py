@@ -269,7 +269,8 @@ class GRPOTrainer:
             dim=1,
         )
         output = model(token_ids)
-        logits = output.logits[:, group.prompt_length() :]
+        # IMPORTANT we want the logits for the last input token
+        logits = output.logits[:, group.prompt_length() - 1 : -1]
         log_probs = torch.log_softmax(logits, dim=1)
         # selecting indices of log_probs on the last column
         response_log_probs = torch.gather(
