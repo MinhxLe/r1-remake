@@ -5,13 +5,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from dataclasses import dataclass, field
 from r1.data.core import Chat
 import wandb
+from r1.os_utils import print_gpu_memory
 from r1.utils import model_utils
 from r1.data.countdown import get_dataset, compute_score
 import random
 from loguru import logger
 from tqdm import tqdm
 from datetime import datetime
-# from vllm import LLM, SamplingParams
 
 
 @dataclass
@@ -30,7 +30,7 @@ class Cfg:
     max_new_tokens: int = 500
 
     # Training configs
-    train_batch_size: int = 8
+    train_batch_size: int = 1
     test_batch_size: int = 8
     lr: float = 1e-5
     n_epochs: int = 1
@@ -99,7 +99,7 @@ class GRPOTrainer:
         self.model = AutoModelForCausalLM.from_pretrained(
             cfg.model_name,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            # attn_implementation="flash_attention_2",
             device_map="auto",
         )
 
@@ -116,6 +116,9 @@ class GRPOTrainer:
         train_dataset = self.train_dataset
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
         # TODO, maybe we should pre tokenize prompts
+        assert cfg.train_batch_size == 1
+        # TODO for now we have this constraint so we don't need to have target model
+        # seperately.
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=cfg.train_batch_size,
@@ -125,8 +128,8 @@ class GRPOTrainer:
         ref_model = model_utils.copy_model(model).to(cfg.device)
         ref_model.eval()
 
-        target_model = model_utils.copy_model(model).to(cfg.device)
-        target_model.eval()
+        # target_model = model_utils.copy_model(model).to(cfg.device)
+        # target_model.eval()
 
         if cfg.log_wandb:
             wandb.init(
@@ -143,7 +146,7 @@ class GRPOTrainer:
                 step = epoch * cfg.n_epochs + i
                 if (step % cfg.ref_model_update_interval) == 0:
                     model_utils.sync_model(model, ref_model)
-                model_utils.sync_model(model, target_model)
+                # model_utils.sync_model(model, target_model)
                 # TODO operate over full batch of tasks
                 total_n_correct = 0
                 total_loss = 0
@@ -152,7 +155,7 @@ class GRPOTrainer:
                 for row in batch_rows:
                     prompt = row["prompt"]
                     task = row["task"]
-                    group = self.sample_group(target_model, prompt)
+                    group = self.sample_group(model, prompt)
                     group_responses = self.tokenizer.batch_decode(
                         group.response_token_ids, skip_special_tokens=True
                     )
@@ -186,6 +189,7 @@ class GRPOTrainer:
 
                     model.train()
                     model.gradient_checkpointing_enable()
+                    print_gpu_memory()
                     for _ in range(cfg.mu):
                         total_loss += self._update_model(
                             optimizer,
@@ -196,6 +200,7 @@ class GRPOTrainer:
                         )
                         torch.cuda.empty_cache()  # Explicitly reclaim freed memory
                     model.gradient_checkpointing_disable()
+                    print_gpu_memory()
                     total_n_correct += (rewards == cfg.solve_score).sum().item()
                     total_response_length += group.response_masks.sum().item()
                     total_reward += rewards.sum().item()
@@ -281,73 +286,6 @@ class GRPOTrainer:
         ).squeeze(-1)
         assert response_log_probs.shape == group.response_log_probs.shape
         return response_log_probs
-
-    @torch.no_grad()
-    def sample_group_v2(self, model, prompt: list[Chat]) -> Group:
-        tokenizer, cfg = self.tokenizer, self.cfg
-        group_size, max_new_tokens = cfg.group_size, cfg.max_new_tokens
-
-        # Initialize vLLM if not already done
-        if not hasattr(self, "vllm_engine"):
-            self.vllm_engine = LLM(
-                model=model.cfg.model_name,
-                dtype="auto",
-                gpu_memory_utilization=0.8,
-                tensor_parallel_size=1,  # adjust based on your GPU setup
-            )
-            self.sampling_params = SamplingParams(
-                max_tokens=max_new_tokens,
-                temperature=1.0,
-                top_p=1.0,
-                n=group_size,  # number of generations per prompt
-            )
-
-        # Format prompt for vLLM
-        if cfg.use_instruct_prompt:
-            formatted_prompt = tokenizer.apply_chat_template(
-                [prompt], return_tensors="pt"
-            )
-            # Convert to string for vLLM
-            formatted_prompt = tokenizer.decode(
-                formatted_prompt[0], skip_special_tokens=False
-            )
-        else:
-            formatted_prompt = prompt
-
-        # Generate responses using vLLM
-        outputs = self.vllm_engine.generate([formatted_prompt], self.sampling_params)
-
-        # Process the outputs
-        prompt_token_ids = tokenizer([formatted_prompt], return_tensors="pt").input_ids
-        prompt_length = prompt_token_ids.shape[-1]
-
-        # Extract generated sequences, convert to token IDs
-        generations = [output.outputs[0].text for output in outputs]
-        all_token_ids = []
-        all_logprobs = []
-        max_length = 0
-
-        # Process each generated output
-        for gen in generations:
-            gen_tokens = tokenizer(gen, return_tensors="pt").input_ids[0]
-            all_token_ids.append(gen_tokens)
-            max_length = max(max_length, len(gen_tokens))
-
-        # Pad sequences to the same length
-        response_token_ids = torch.full(
-            (group_size, max_length), tokenizer.pad_token_id
-        )
-        response_masks = torch.zeros((group_size, max_length), dtype=torch.bool)
-
-        for i, tokens in enumerate(all_token_ids):
-            response_token_ids[i, : len(tokens)] = tokens
-            response_masks[i, : len(tokens)] = True
-        return Group(
-            prompt_token_ids=prompt_token_ids,
-            response_token_ids=response_token_ids,
-            response_log_probs=None,
-            response_masks=response_masks,
-        )
 
     @torch.no_grad()
     def sample_group(self, model, prompt: list[Chat]) -> Group:
