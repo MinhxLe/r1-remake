@@ -4,7 +4,7 @@ REMOTE_PROJECT_DIR="~/r1"
 INSTANCE_ID=${1:-$(vastai show instances --raw | jq -r '.[0].id')}
 echo "Syncing instance $INSTANCE_ID"
 INSTANCE_IP=$(vastai show instance $INSTANCE_ID --raw | jq -r '.public_ipaddr')
-INSTANCE_PORT=$(vastai show instance $INSTANCE_ID --raw | jq -r '.direct_port_start')
+INSTANCE_PORT=$(vastai show instance $INSTANCE_ID --raw | jq -r '.ports."22/tcp"[0].HostPort')
 
 ssh -p $INSTANCE_PORT root@$INSTANCE_IP  'mkdir -p $REMOTE_PROJECT_DIR'
 

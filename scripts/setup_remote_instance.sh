@@ -18,7 +18,7 @@ vastai attach ssh $INSTANCE_ID "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJOXK95nR8tL
 vastai attach ssh $INSTANCE_ID "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJoxVhUrbJCg5VU75zZ4Zv+zVKQQspTop9Xq4Uvum2FY sidpatel99@gmail.com"
 
 INSTANCE_IP=$(vastai show instance $INSTANCE_ID --raw | jq -r '.public_ipaddr')
-INSTANCE_PORT=$(vastai show instance $INSTANCE_ID --raw | jq -r '.direct_port_start')
+INSTANCE_PORT=$(vastai show instance $INSTANCE_ID --raw | jq -r '.ports."22/tcp"[0].HostPort')
 
 # set up uv
 ssh -p $INSTANCE_PORT root@$INSTANCE_IP "curl -LsSf https://astral.sh/uv/install.sh | sh"
