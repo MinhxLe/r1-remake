@@ -177,10 +177,10 @@ class GRPOTrainer:
                         logger.debug(f"response: {response_i}, reward: {reward}")
                         logger.debug(response)
                     normalized_advantages = (
-                        ((rewards - rewards.mean()) / (rewards.std() + 1e-5))
-                        .unsqueeze(-1)  # adding seq_len dimension
+                        self.compute_normalized_advantages(rewards)
+                        .unsqueeze(-1)
                         .repeat((1, group.max_response_length()))
-                    ).to(cfg.device)
+                    )
 
                     with torch.no_grad():
                         ref_log_probs = self.compute_response_log_probs(
@@ -232,26 +232,15 @@ class GRPOTrainer:
         self, optimizer, model, ref_log_probs, group, normalized_advantages
     ):
         model_log_probs = self.compute_response_log_probs(model, group)
-        ratio = torch.exp(model_log_probs - group.response_log_probs)
-        clipped_ratio = torch.clamp(ratio, 1 - cfg.epsilon, 1 + cfg.epsilon)
-        policy_objectives = torch.min(
-            ratio * normalized_advantages,
-            clipped_ratio * normalized_advantages,
-        )  # (group_size, max_response_length)
-        # kl estimator
-        kls = (
-            torch.exp(ref_log_probs - model_log_probs)
-            - (ref_log_probs - model_log_probs)
-            - 1
+        policy_objectives = self._compute_policy_objective(
+            model_log_probs, group.response_log_probs, normalized_advantages
         )
-        all_objectives = (
-            policy_objectives - cfg.beta * kls
-        )  # (group_size, max_response_length)
-        objective = (
-            # mean per response
-            (all_objectives * group.response_masks).sum(dim=1)
-            / group.response_masks.sum(dim=1)
-        ).mean()  # mean over group
+        # kl estimator
+        kls = self._compute_kl_divergence(ref_log_probs, model_log_probs)
+
+        objective = self._compute_total_objective(
+            policy_objectives=policy_objectives, kls=kls, group=group
+        )
 
         mean_policy_objective = (
             policy_objectives.sum() / group.response_masks.sum()
@@ -325,6 +314,63 @@ class GRPOTrainer:
             response_log_probs=response_log_probs,
             response_masks=response_masks,
         )
+
+    @staticmethod
+    def compute_normalized_advantages(rewards: torch.Tensor) -> torch.Tensor:
+        """Compute normalized advantages from rewards.
+        Args:
+            rewards: Tensor of shape (group_size,)
+        Returns:
+            Tensor of shape (group_size,)
+        """
+        return (rewards - rewards.mean()) / (rewards.std() + 1e-5)
+
+    def _compute_policy_objective(
+        self,
+        new_log_probs: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        normalized_advantages: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the clipped policy objective."""
+        cfg = self.cfg
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        clipped_ratio = torch.clamp(ratio, 1 - cfg.epsilon, 1 + cfg.epsilon)
+        return torch.min(
+            ratio * normalized_advantages,
+            clipped_ratio * normalized_advantages,
+        )  # (group_size, max_response_length)
+
+    @staticmethod
+    def _compute_kl_divergence(
+        ref_log_probs: torch.Tensor,
+        model_log_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute KL divergence between reference and model distributions.
+        Args:
+            ref_log_probs: Tensor of shape (group_size, max_response_length)
+            model_log_probs: Tensor of shape (group_size, max_response_length)
+        Returns:
+            Tensor of shape (group_size, max_response_length)
+        """
+        return (
+            torch.exp(ref_log_probs - model_log_probs)
+            - (ref_log_probs - model_log_probs)
+            - 1
+        )
+
+    def _compute_total_objective(
+        self, policy_objectives: torch.Tensor, kls: torch.Tensor, group: Group
+    ) -> torch.Tensor:
+        """Compute the objective."""
+
+        all_objectives = (
+            policy_objectives - self.cfg.beta * kls
+        )  # (group_size, max_response_length)
+        return (
+            # mean per response
+            (all_objectives * group.response_masks).sum(dim=1)
+            / group.response_masks.sum(dim=1)
+        ).mean()  # mean over group
 
 
 if __name__ == "__main__":
