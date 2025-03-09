@@ -11,13 +11,13 @@ class TestComputeNormalizedAdvantages:
     def test_basic_normalization(self):
         rewards = torch.tensor([0.0, 0.0, 1.0, 1.0], dtype=torch.float32)
         expected = torch.tensor([-1.0, -1.0, 1.0, 1.0], dtype=torch.float32)
-        result = GRPOTrainer.compute_normalized_advantages(rewards)
+        result = GRPOTrainer._compute_normalized_advantages(rewards)
         torch.testing.assert_close(result, expected)
 
     def test_single_value(self):
         rewards = torch.tensor([1.0], dtype=torch.float32)
         expected = torch.tensor([0.0], dtype=torch.float32)
-        result = GRPOTrainer.compute_normalized_advantages(rewards)
+        result = GRPOTrainer._compute_normalized_advantages(rewards)
         torch.testing.assert_close(result, expected)
 
 

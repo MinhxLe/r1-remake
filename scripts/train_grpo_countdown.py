@@ -177,10 +177,10 @@ class GRPOTrainer:
                         logger.debug(f"response: {response_i}, reward: {reward}")
                         logger.debug(response)
                     normalized_advantages = (
-                        self.compute_normalized_advantages(rewards)
+                        self._compute_normalized_advantages(rewards)
                         .unsqueeze(-1)
                         .repeat((1, group.max_response_length()))
-                    )
+                    ).to(cfg.device)
 
                     with torch.no_grad():
                         ref_log_probs = self.compute_response_log_probs(
@@ -316,7 +316,7 @@ class GRPOTrainer:
         )
 
     @staticmethod
-    def compute_normalized_advantages(rewards: torch.Tensor) -> torch.Tensor:
+    def _compute_normalized_advantages(rewards: torch.Tensor) -> torch.Tensor:
         """Compute normalized advantages from rewards.
         Args:
             rewards: Tensor of shape (group_size,)
@@ -380,6 +380,7 @@ if __name__ == "__main__":
         train_dataset=get_dataset("train", cfg.use_instruct_prompt),
         test_dataset=get_dataset("test", cfg.use_instruct_prompt),
     )
+    trainer.train()
     # dataset = trainer.train_dataset
     # rewards = []
     # for i, row in tqdm(enumerate(dataset)):
