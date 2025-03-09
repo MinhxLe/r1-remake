@@ -380,12 +380,14 @@ if __name__ == "__main__":
     with open("data/qwen_at_least_1_examples.pkl", "rb") as file:
         indices_with_correct = pkl.load(file)
 
+    train_dataset = get_dataset("train", cfg.use_instruct_prompt).select(
+        indices_with_correct
+    )
+
     trainer = GRPOTrainer(
         cfg=cfg,
-        train_dataset=get_dataset("train", cfg.use_instruct_prompt).select(
-            indices_with_correct
-        ),
-        test_dataset=get_dataset("test", cfg.use_instruct_prompt),
+        train_dataset=train_dataset,
+        test_dataset=train_dataset,  # don't have a test split yet!!
     )
     trainer.train()
     # dataset = trainer.train_dataset
