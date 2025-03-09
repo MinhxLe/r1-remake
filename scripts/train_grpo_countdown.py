@@ -12,6 +12,7 @@ import random
 from loguru import logger
 from tqdm import tqdm
 from datetime import datetime
+import pickle as pkl
 
 
 @dataclass
@@ -33,7 +34,7 @@ class Cfg:
     train_batch_size: int = 1
     test_batch_size: int = 8
     lr: float = 1e-5
-    n_epochs: int = 1
+    n_epochs: int = 3
 
     # GRPO specific configs
     group_size: int = 5  # G in the paper
@@ -375,9 +376,15 @@ class GRPOTrainer:
 
 if __name__ == "__main__":
     cfg = Cfg()
+
+    with open("data/qwen_at_least_1_examples.pkl", "rb") as file:
+        indices_with_correct = pkl.load(file)
+
     trainer = GRPOTrainer(
         cfg=cfg,
-        train_dataset=get_dataset("train", cfg.use_instruct_prompt),
+        train_dataset=get_dataset("train", cfg.use_instruct_prompt).select(
+            indices_with_correct
+        ),
         test_dataset=get_dataset("test", cfg.use_instruct_prompt),
     )
     trainer.train()
