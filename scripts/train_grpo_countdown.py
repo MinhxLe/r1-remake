@@ -27,7 +27,7 @@ class Cfg:
     # model_temperature: float = 0.7
 
     # Generation configs
-    max_new_tokens: int = 500
+    max_new_tokens: int = 400
 
     # Training configs
     train_batch_size: int = 1
@@ -126,11 +126,6 @@ class GRPOTrainer:
             collate_fn=lambda x: x,
         )
         ref_model = model_utils.copy_model(model).to(cfg.device)
-        ref_model.eval()
-
-        # target_model = model_utils.copy_model(model).to(cfg.device)
-        # target_model.eval()
-
         if cfg.log_wandb:
             wandb.init(
                 project="countdown-grpo",
@@ -146,8 +141,6 @@ class GRPOTrainer:
                 step = epoch * cfg.n_epochs + i
                 if (step % cfg.ref_model_update_interval) == 0:
                     model_utils.sync_model(model, ref_model)
-                # model_utils.sync_model(model, target_model)
-                # TODO operate over full batch of tasks
                 total_n_correct = 0
                 total_loss = 0
                 total_response_length = 0
@@ -168,14 +161,14 @@ class GRPOTrainer:
                         ],
                         dtype=torch.bfloat16,
                     )
-                    logger.debug("sampling group")
-                    logger.debug(f"TASK: {task}")
-                    logger.debug("RESPONSES: ")
-                    for response_i, (response, reward) in enumerate(
-                        zip(group_responses, rewards)
-                    ):
-                        logger.debug(f"response: {response_i}, reward: {reward}")
-                        logger.debug(response)
+                    # logger.debug("sampling group")
+                    # logger.debug(f"TASK: {task}")
+                    # logger.debug("RESPONSES: ")
+                    # for response_i, (response, reward) in enumerate(
+                    #     zip(group_responses, rewards)
+                    # ):
+                    #     logger.debug(f"response: {response_i}, reward: {reward}")
+                    #     logger.debug(response)
                     normalized_advantages = (
                         ((rewards - rewards.mean()) / (rewards.std() + 1e-5))
                         .unsqueeze(-1)  # adding seq_len dimension
@@ -189,7 +182,6 @@ class GRPOTrainer:
 
                     model.train()
                     model.gradient_checkpointing_enable()
-                    print_gpu_memory()
                     for _ in range(cfg.mu):
                         total_loss += self._update_model(
                             optimizer,
@@ -200,7 +192,6 @@ class GRPOTrainer:
                         )
                         torch.cuda.empty_cache()  # Explicitly reclaim freed memory
                     model.gradient_checkpointing_disable()
-                    print_gpu_memory()
                     total_n_correct += (rewards == cfg.solve_score).sum().item()
                     total_response_length += group.response_masks.sum().item()
                     total_reward += rewards.sum().item()
@@ -278,7 +269,8 @@ class GRPOTrainer:
             dim=1,
         )
         output = model(token_ids)
-        logits = output.logits[:, group.prompt_length() :]
+        # IMPORTANT we want the logits for the last input token
+        logits = output.logits[:, group.prompt_length() - 1 : -1]
         log_probs = torch.log_softmax(logits, dim=1)
         # selecting indices of log_probs on the last column
         response_log_probs = torch.gather(
