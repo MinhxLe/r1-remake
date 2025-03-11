@@ -5,13 +5,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from dataclasses import dataclass, field
 from r1.data.core import Chat
 import wandb
-from r1.os_utils import print_gpu_memory
 from r1.utils import model_utils
 from r1.data.countdown import get_dataset, compute_score
 import random
 from loguru import logger
 from tqdm import tqdm
 from datetime import datetime
+import pickle as pkl
 
 
 @dataclass
@@ -27,13 +27,13 @@ class Cfg:
     # model_temperature: float = 0.7
 
     # Generation configs
-    max_new_tokens: int = 500
+    max_new_tokens: int = 400
 
     # Training configs
     train_batch_size: int = 1
     test_batch_size: int = 8
-    lr: float = 1e-5
-    n_epochs: int = 1
+    lr: float = 1e-6
+    n_epochs: int = 5
 
     # GRPO specific configs
     group_size: int = 5  # G in the paper
@@ -43,7 +43,7 @@ class Cfg:
     ref_model_update_interval: int = 20  # how frequently do we update ref model (M)
 
     # Reward configs
-    format_score: float = 0.1
+    format_score: float = 0.0
     solve_score: float = 1.0
 
     # Logging configs
@@ -126,11 +126,6 @@ class GRPOTrainer:
             collate_fn=lambda x: x,
         )
         ref_model = model_utils.copy_model(model).to(cfg.device)
-        ref_model.eval()
-
-        # target_model = model_utils.copy_model(model).to(cfg.device)
-        # target_model.eval()
-
         if cfg.log_wandb:
             wandb.init(
                 project="countdown-grpo",
@@ -146,8 +141,6 @@ class GRPOTrainer:
                 step = epoch * cfg.n_epochs + i
                 if (step % cfg.ref_model_update_interval) == 0:
                     model_utils.sync_model(model, ref_model)
-                # model_utils.sync_model(model, target_model)
-                # TODO operate over full batch of tasks
                 total_n_correct = 0
                 total_loss = 0
                 total_response_length = 0
@@ -168,14 +161,14 @@ class GRPOTrainer:
                         ],
                         dtype=torch.bfloat16,
                     )
-                    logger.debug("sampling group")
-                    logger.debug(f"TASK: {task}")
-                    logger.debug("RESPONSES: ")
-                    for response_i, (response, reward) in enumerate(
-                        zip(group_responses, rewards)
-                    ):
-                        logger.debug(f"response: {response_i}, reward: {reward}")
-                        logger.debug(response)
+                    # logger.debug("sampling group")
+                    # logger.debug(f"TASK: {task}")
+                    # logger.debug("RESPONSES: ")
+                    # for response_i, (response, reward) in enumerate(
+                    #     zip(group_responses, rewards)
+                    # ):
+                    #     logger.debug(f"response: {response_i}, reward: {reward}")
+                    #     logger.debug(response)
                     normalized_advantages = (
                         ((rewards - rewards.mean()) / (rewards.std() + 1e-5))
                         .unsqueeze(-1)  # adding seq_len dimension
@@ -189,7 +182,6 @@ class GRPOTrainer:
 
                     model.train()
                     model.gradient_checkpointing_enable()
-                    print_gpu_memory()
                     for _ in range(cfg.mu):
                         total_loss += self._update_model(
                             optimizer,
@@ -200,7 +192,6 @@ class GRPOTrainer:
                         )
                         torch.cuda.empty_cache()  # Explicitly reclaim freed memory
                     model.gradient_checkpointing_disable()
-                    print_gpu_memory()
                     total_n_correct += (rewards == cfg.solve_score).sum().item()
                     total_response_length += group.response_masks.sum().item()
                     total_reward += rewards.sum().item()
@@ -225,8 +216,8 @@ class GRPOTrainer:
                 # TODO add saving model
                 # TODO add eval
 
-            if cfg.log_wandb:
-                wandb.finish()
+        if cfg.log_wandb:
+            wandb.finish()
 
     def _update_model(
         self, optimizer, model, ref_log_probs, group, normalized_advantages
@@ -278,7 +269,8 @@ class GRPOTrainer:
             dim=1,
         )
         output = model(token_ids)
-        logits = output.logits[:, group.prompt_length() :]
+        # IMPORTANT we want the logits for the last input token
+        logits = output.logits[:, group.prompt_length() - 1 : -1]
         log_probs = torch.log_softmax(logits, dim=1)
         # selecting indices of log_probs on the last column
         response_log_probs = torch.gather(
@@ -328,12 +320,19 @@ class GRPOTrainer:
 
 
 if __name__ == "__main__":
-    cfg = Cfg()
+    with open("data/qwen_at_least_1_examples.pkl", "rb") as file:
+        indices_with_correct = pkl.load(file)
+
+    train_dataset = get_dataset("train", cfg.use_instruct_prompt).select(
+        indices_with_correct
+    )
+
     trainer = GRPOTrainer(
         cfg=cfg,
-        train_dataset=get_dataset("train", cfg.use_instruct_prompt),
-        test_dataset=get_dataset("test", cfg.use_instruct_prompt),
+        train_dataset=train_dataset,
+        test_dataset=train_dataset,  # don't have a test split yet!!
     )
+    trainer.train()
     # dataset = trainer.train_dataset
     # rewards = []
     # for i, row in tqdm(enumerate(dataset)):
