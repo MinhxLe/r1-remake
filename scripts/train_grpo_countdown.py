@@ -38,12 +38,12 @@ class Cfg:
     # GRPO specific configs
     group_size: int = 5  # G in the paper
     epsilon: float = 0.2  # ε for clipping
-    beta: float = 0.000  # KL divergence penalty coefficient
+    beta: float = 0.001  # KL divergence penalty coefficient
     mu: int = 1  # Number of optimization steps per prompt
     ref_model_update_interval: int = 20  # how frequently do we update ref model (M)
 
     # Reward configs
-    format_score: float = 0.1
+    format_score: float = 0.0
     solve_score: float = 1.0
 
     # Logging configs
