@@ -13,6 +13,7 @@ echo "Instance is now running"
 # id for minh ssh
 vastai attach ssh $INSTANCE_ID "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGNUr5z1YufAaVBGoqemW5gEDsP9/FwXkHXio5DeUCps minh.d.le27@gmail.com"
 vastai attach ssh $INSTANCE_ID "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJOXK95nR8tL3iJlyzR5yVmln1s31VZz/5z00rNIqmQ5 minh.d.le27@gmail.com"
+vastai attach ssh $INSTANCE_ID "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJoxVhUrbJCg5VU75zZ4Zv+zVKQQspTop9Xq4Uvum2FY sidpatel99@gmail.com"
 
 # id for sid ssh
 vastai attach ssh $INSTANCE_ID "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJoxVhUrbJCg5VU75zZ4Zv+zVKQQspTop9Xq4Uvum2FY sidpatel99@gmail.com"
