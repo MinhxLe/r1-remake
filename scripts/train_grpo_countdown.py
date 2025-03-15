@@ -32,8 +32,8 @@ class Cfg:
     # Training configs
     train_batch_size: int = 1
     test_batch_size: int = 8
-    lr: float = 1e-6
-    n_epochs: int = 5
+    lr: float = 1e-5
+    n_epochs: int = 3
 
     # GRPO specific configs
     group_size: int = 5  # G in the paper
@@ -43,7 +43,7 @@ class Cfg:
     ref_model_update_interval: int = 20  # how frequently do we update ref model (M)
 
     # Reward configs
-    format_score: float = 0.0
+    format_score: float = 0.1
     solve_score: float = 1.0
 
     # Logging configs
