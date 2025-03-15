@@ -126,6 +126,8 @@ class GRPOTrainer:
             collate_fn=lambda x: x,
         )
         ref_model = model_utils.copy_model(model).to(cfg.device)
+        ref_model.eval()
+
         if cfg.log_wandb:
             wandb.init(
                 project="countdown-grpo",
