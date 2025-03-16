@@ -33,7 +33,7 @@ class Cfg:
     train_batch_size: int = 1
     test_batch_size: int = 8
     lr: float = 3e-6
-    n_epochs: int = 5
+    n_epochs: int = 3
 
     # GRPO specific configs
     group_size: int = 5  # G in the paper
