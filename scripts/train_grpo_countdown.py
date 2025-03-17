@@ -32,7 +32,7 @@ class Cfg:
     # Training configs
     train_batch_size: int = 1
     test_batch_size: int = 8
-    lr: float = 1e-5
+    lr: float = 3e-6
     n_epochs: int = 3
 
     # GRPO specific configs
@@ -43,7 +43,7 @@ class Cfg:
     ref_model_update_interval: int = 20  # how frequently do we update ref model (M)
 
     # Reward configs
-    format_score: float = 0.1
+    format_score: float = 0.0
     solve_score: float = 1.0
 
     # Logging configs
@@ -322,19 +322,27 @@ class GRPOTrainer:
 
 
 if __name__ == "__main__":
+    base_train_dataset = get_dataset("train", cfg.use_instruct_prompt)
+
+    # warmup on examples base model can already solve
     with open("data/qwen_at_least_1_examples.pkl", "rb") as file:
         indices_with_correct = pkl.load(file)
-
-    train_dataset = get_dataset("train", cfg.use_instruct_prompt).select(
-        indices_with_correct
-    )
+    warmup_train_dataset = base_train_dataset.select(indices_with_correct)
 
     trainer = GRPOTrainer(
         cfg=cfg,
-        train_dataset=train_dataset,
-        test_dataset=train_dataset,  # don't have a test split yet!!
+        train_dataset=warmup_train_dataset,
+        test_dataset=warmup_train_dataset,  # don't have a test split yet!!
     )
     trainer.train()
+
+    # TODO - make this less hacky - here we change stuff in place to run on full dataset
+    trainer.train_dataset = base_train_dataset
+    trainer.test_dataset = base_train_dataset
+    trainer.cfg.n_epochs = 1
+
+    trainer.train()
+
     # dataset = trainer.train_dataset
     # rewards = []
     # for i, row in tqdm(enumerate(dataset)):
