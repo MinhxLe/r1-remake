@@ -31,7 +31,7 @@ class Cfg:
 
     # Training configs
     train_batch_size: int = 1
-    test_batch_size: int = 8
+    test_batch_size: int = 1
     lr: float = 3e-6
     n_epochs: int = 3
 
@@ -48,6 +48,7 @@ class Cfg:
 
     # Logging configs
     train_log_interval: int = 1
+    test_log_interval: int = 8
     eval_interval: int = 100
     save_interval: int = 100
     log_wandb: bool = True
@@ -132,7 +133,7 @@ class GRPOTrainer:
             wandb.init(
                 project="countdown-grpo",
                 config=vars(cfg),
-                name=f"grpo_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                name=f"grpo_train_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             )
 
         random.seed(cfg.seed)
@@ -217,6 +218,66 @@ class GRPOTrainer:
                     logger.info(metrics)
                 # TODO add saving model
                 # TODO add eval
+
+        if cfg.log_wandb:
+            wandb.finish()
+
+    def test(self):
+        cfg = self.cfg
+        model = self.model
+        model.eval()
+
+        test_dataloader = DataLoader(
+            self.test_dataset,
+            batch_size=cfg.test_batch_size,
+            shuffle=True,
+            collate_fn=lambda x: x,
+        )
+
+        if cfg.log_wandb:
+            wandb.init(
+                project="countdown-grpo",
+                config=vars(cfg),
+                name=f"grpo_test_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            )
+
+        random.seed(cfg.seed)
+        torch.random.manual_seed(cfg.seed)
+
+        for step, batch_rows in tqdm(enumerate(test_dataloader)):
+            total_n_correct = 0
+            total_response_length = 0
+            total_reward = 0
+            for row in batch_rows:
+                prompt = row["prompt"]
+                task = row["task"]
+                group = self.sample_group(model, prompt)
+                group_responses = self.tokenizer.batch_decode(
+                    group.response_token_ids, skip_special_tokens=True
+                )
+                rewards = torch.tensor(
+                    [
+                        compute_score(response, task, cfg.format_score, cfg.solve_score)
+                        for response in group_responses
+                    ],
+                    dtype=torch.bfloat16,
+                )
+
+                total_n_correct += (rewards == cfg.solve_score).sum().item()
+                total_response_length += group.response_masks.sum().item()
+                total_reward += rewards.sum().item()
+            metrics = dict(
+                step=step,
+                test_accuracy=total_n_correct / (cfg.test_batch_size * cfg.group_size),
+                test_mean_response_length=(
+                    total_response_length / (cfg.test_batch_size * cfg.group_size)
+                ),
+                mean_reward=(total_reward / (cfg.test_batch_size * cfg.group_size)),
+            )
+            if cfg.log_wandb:
+                wandb.log(metrics)
+            if (step % cfg.test_log_interval) == 0:
+                logger.info(metrics)
 
         if cfg.log_wandb:
             wandb.finish()
@@ -326,35 +387,18 @@ if __name__ == "__main__":
 
     # warmup on examples base model can already solve
     with open("data/qwen_at_least_1_examples.pkl", "rb") as file:
-        indices_with_correct = pkl.load(file)
+        indices_with_correct = set(pkl.load(file))
+
     warmup_train_dataset = base_train_dataset.select(indices_with_correct)
+    remaining_train_dataset = base_train_dataset.filter(
+        lambda _, idx: idx not in indices_with_correct,
+        with_indices=True,
+    )
 
     trainer = GRPOTrainer(
         cfg=cfg,
         train_dataset=warmup_train_dataset,
-        test_dataset=warmup_train_dataset,  # don't have a test split yet!!
+        test_dataset=remaining_train_dataset,
     )
     trainer.train()
-
-    # TODO - make this less hacky - here we change stuff in place to run on full dataset
-    trainer.train_dataset = base_train_dataset
-    trainer.test_dataset = base_train_dataset
-    trainer.cfg.n_epochs = 1
-
-    trainer.train()
-
-    # dataset = trainer.train_dataset
-    # rewards = []
-    # for i, row in tqdm(enumerate(dataset)):
-    #     group = trainer.sample_group(trainer.model, row["prompt"])
-    #
-    #     group_responses = trainer.tokenizer.batch_decode(
-    #         group.response_token_ids, skip_special_tokens=True
-    #     )
-    #     rewards.append(
-    #         [
-    #             compute_score(response, row["task"], cfg.format_score, cfg.solve_score)
-    #             for response in group_responses
-    #         ]
-    #     )
-    #     print(f"task {i / len(dataset)}, reward {rewards[-1]}")
+    trainer.test()
